@@ -2842,6 +2842,16 @@ extern "C" void f3d_reset_framebuffer(void) {
  * GfxRenderingAPI directly (video.c:381,469); they are part of the backend
  * contract now so video.c never needs a rapi pointer.
  */
+/*
+ * The authoritative segment table. It persists across frames (reset only in
+ * f3d_init) so anything mirroring it must seed from here rather than
+ * rebuilding per frame - display-list capture got this wrong and produced
+ * unresolvable segmented addresses.
+ */
+extern "C" const uintptr_t *f3d_get_segment_table(void) {
+    return segmentPointers;
+}
+
 extern "C" int f3d_get_max_anisotropy_level(void) {
     return gfx_rapi->get_max_anisotropy_level();
 }

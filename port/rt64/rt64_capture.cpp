@@ -27,6 +27,10 @@
  * discovered and the total is not known when the header is written.
  */
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,6 +55,8 @@ extern "C" {
 extern "C" {
 #include "gbiex.h"
 }
+
+extern "C" const uintptr_t *f3d_get_segment_table(void);
 
 extern u8 *g_MempHeap;
 extern u32 g_MempHeapSize;
@@ -95,8 +101,8 @@ struct CaptureState {
      * Untracked references are counted but never dereferenced - we cannot
      * prove those pages are mapped, and a bad read would take the game down
      * mid-capture. */
-    uint32_t heapBlocks = 0, romBlocks = 0, untrackedRefs = 0;
-    uint64_t heapBytes = 0, romBytes = 0, untrackedBytes = 0;
+    uint32_t heapBlocks = 0, romBlocks = 0, imageBlocks = 0, untrackedRefs = 0;
+    uint64_t heapBytes = 0, romBytes = 0, imageBytes = 0, untrackedBytes = 0;
 
     /* Golden image for this frame, if the backend supplied one. */
     std::vector<uint8_t> goldenRgb;
@@ -121,6 +127,36 @@ void *segAddr(uintptr_t w1)
     return (void *)w1;
 }
 
+/*
+ * The executable's own image. Display lists reference static data compiled
+ * into the binary - light and viewport blocks reached via G_MOVEMEM - which
+ * is neither heap nor ROM. The image is mapped for the process lifetime, so
+ * reading it is safe; bounds come from the PE headers rather than a guess.
+ */
+uintptr_t g_imageBase = 0;
+size_t g_imageSize = 0;
+
+void initImageRegion(void)
+{
+#ifdef _WIN32
+    HMODULE mod = GetModuleHandleW(NULL);
+    if (!mod) {
+        return;
+    }
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return;
+    }
+    const IMAGE_NT_HEADERS *nt =
+        (const IMAGE_NT_HEADERS *)((const uint8_t *)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return;
+    }
+    g_imageBase = (uintptr_t)mod;
+    g_imageSize = (size_t)nt->OptionalHeader.SizeOfImage;
+#endif
+}
+
 bool inRegion(uintptr_t addr, size_t len, const u8 *base, u32 size)
 {
     if (!base || !addr || !len) {
@@ -139,9 +175,16 @@ bool inHeap(uintptr_t addr, size_t len)
  * references the loaded ROM image directly (12 commands per frame at
  * STAGE_CITRAINING). Both regions must be captured, and the translator will
  * have to marshal from both. */
+bool inImage(uintptr_t addr, size_t len)
+{
+    return g_imageSize && addr >= g_imageBase &&
+           (addr + len) <= (g_imageBase + g_imageSize);
+}
+
 bool inCapturableMemory(uintptr_t addr, size_t len)
 {
-    return inHeap(addr, len) || inRegion(addr, len, g_RomFile, g_RomFileSize);
+    return inHeap(addr, len) || inRegion(addr, len, g_RomFile, g_RomFileSize) ||
+           inImage(addr, len);
 }
 
 /* Records [addr, addr+len). Refuses anything outside the memp heap: the
@@ -158,12 +201,21 @@ void recordRange(uintptr_t addr, size_t len)
          * reached through a G_MOVEWORD segment base. Size it, do not read it. */
         ++g_cap.untrackedRefs;
         g_cap.untrackedBytes += len;
+        /* Diagnostic: the first few addresses per frame, so they can be matched
+         * against the region spans logged at startup. */
+        if (g_cap.untrackedRefs <= 4) {
+            sysLogPrintf(LOG_NOTE, "census: untracked ref %p (%u bytes)",
+                         (void *)addr, (unsigned)len);
+        }
         return;
     }
 
     if (inHeap(addr, len)) {
         ++g_cap.heapBlocks;
         g_cap.heapBytes += len;
+    } else if (inImage(addr, len)) {
+        ++g_cap.imageBlocks;
+        g_cap.imageBytes += len;
     } else {
         ++g_cap.romBlocks;
         g_cap.romBytes += len;
@@ -385,10 +437,11 @@ void flushFrame(void)
         sysLogPrintf(LOG_NOTE, "capture: wrote %s (%u dls, %u ranges, %llu bytes)",
                      path, (unsigned)g_cap.roots.size(), rangeCount,
                      (unsigned long long)rangeBytes);
-        sysLogPrintf(LOG_NOTE, "census: heap %u blocks / %llu B | rom %u blocks / %llu B "
-                     "| untracked %u refs / %llu B",
+        sysLogPrintf(LOG_NOTE, "census: heap %u/%lluB | rom %u/%lluB | image %u/%lluB "
+                     "| untracked %u refs/%lluB",
                      g_cap.heapBlocks, (unsigned long long)g_cap.heapBytes,
                      g_cap.romBlocks, (unsigned long long)g_cap.romBytes,
+                     g_cap.imageBlocks, (unsigned long long)g_cap.imageBytes,
                      g_cap.untrackedRefs, (unsigned long long)g_cap.untrackedBytes);
     }
 
@@ -400,8 +453,8 @@ void flushFrame(void)
 
     g_cap.roots.clear();
     g_cap.ranges.clear();
-    g_cap.heapBlocks = g_cap.romBlocks = g_cap.untrackedRefs = 0;
-    g_cap.heapBytes = g_cap.romBytes = g_cap.untrackedBytes = 0;
+    g_cap.heapBlocks = g_cap.romBlocks = g_cap.imageBlocks = g_cap.untrackedRefs = 0;
+    g_cap.heapBytes = g_cap.romBytes = g_cap.imageBytes = g_cap.untrackedBytes = 0;
     g_cap.goldenRgb.clear();
     g_cap.frameOpen = false;
     ++g_cap.frameIndex;
@@ -484,6 +537,7 @@ extern "C" void pdCaptureArm(const char *pathPrefix, int frames)
     if (!pathPrefix || frames <= 0) {
         return;
     }
+    initImageRegion();
     g_cap.quitWhenDone = sysArgCheck("--capture-quit") != 0;
     /* Levels spend their first frames on loading screens, which are not
      * representative. --capture-skip discards that many rendered frames. */
@@ -510,6 +564,18 @@ extern "C" void pdCaptureOnRun(const Gfx *rootDl)
     if (g_cap.skipLeft > 0) {
         return;
     }
+
+    /* NOT seeded from f3d_get_segment_table(). Tried and reverted: capture
+     * runs before the backend, so that table holds the PREVIOUS frame's
+     * values, and PD rebinds segments per frame against double-buffered
+     * pools. Seeding resolved segmented addresses to the other buffer -
+     * mapped memory, so no crash, but the walker then parsed vertex data as
+     * commands and produced nonsense references (0x0400fcb200a604a1 and
+     * friends). Getting this right needs PD's per-frame segment lifecycle,
+     * which is translator work; see docs/census.md.
+     * Consequence: segmented addresses whose segment is bound before the
+     * first captured frame stay unresolved and are counted as untracked. */
+
     g_cap.frameOpen = true;
     g_cap.roots.push_back((uintptr_t)rootDl);
     walkDl(rootDl, 0);

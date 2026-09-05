@@ -396,6 +396,15 @@ s32 romdataInit(void)
 	// load file table from the files segment
 	romdataInitFiles();
 
+	// Display lists reference segment data directly, and the RT64 backend has
+	// to marshal from wherever it lives, so log each segment's span.
+	for (struct romfile *seg = romSegs; seg->name; ++seg) {
+		if (seg->data && seg->size) {
+			sysLogPrintf(LOG_NOTE, "romdataSeg: %-16s %p - %p (%u bytes, src %d)",
+				seg->name, seg->data, seg->data + seg->size, seg->size, seg->source);
+		}
+	}
+
 	sysLogPrintf(LOG_NOTE, "romdataInit: loaded rom, size = %u", g_RomFileSize);
 
 	return 0;
