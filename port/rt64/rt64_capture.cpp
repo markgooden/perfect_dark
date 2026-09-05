@@ -75,6 +75,8 @@ static inline uint32_t C1(const Gfx *cmd, uint32_t pos, uint32_t width)
 struct CaptureState {
     bool armed = false;
     bool quitWhenDone = false;
+    int skipLeft = 0;      /* rendered frames to discard before recording */
+    bool sawDl = false;    /* a display list arrived this frame */
     int framesLeft = 0;
     int frameIndex = 0;
     std::string prefix;
@@ -88,6 +90,13 @@ struct CaptureState {
     uintptr_t texAddr = 0;
     uint32_t texSiz = 0;
     uint32_t texWidth = 0;
+
+    /* Census (T3-lite): per-region accounting of what the walk referenced.
+     * Untracked references are counted but never dereferenced - we cannot
+     * prove those pages are mapped, and a bad read would take the game down
+     * mid-capture. */
+    uint32_t heapBlocks = 0, romBlocks = 0, untrackedRefs = 0;
+    uint64_t heapBytes = 0, romBytes = 0, untrackedBytes = 0;
 
     /* Golden image for this frame, if the backend supplied one. */
     std::vector<uint8_t> goldenRgb;
@@ -140,9 +149,26 @@ bool inCapturableMemory(uintptr_t addr, size_t len)
  * out-of-heap references are exactly what task T3 exists to census. */
 void recordRange(uintptr_t addr, size_t len)
 {
-    if (!len || !inCapturableMemory(addr, len)) {
+    if (!len) {
         return;
     }
+
+    if (!inCapturableMemory(addr, len)) {
+        /* A real reference into an allocation we do not model - almost always
+         * reached through a G_MOVEWORD segment base. Size it, do not read it. */
+        ++g_cap.untrackedRefs;
+        g_cap.untrackedBytes += len;
+        return;
+    }
+
+    if (inHeap(addr, len)) {
+        ++g_cap.heapBlocks;
+        g_cap.heapBytes += len;
+    } else {
+        ++g_cap.romBlocks;
+        g_cap.romBytes += len;
+    }
+
     auto it = g_cap.ranges.find(addr);
     if (it != g_cap.ranges.end() && it->second.size() >= len) {
         return;
@@ -359,6 +385,11 @@ void flushFrame(void)
         sysLogPrintf(LOG_NOTE, "capture: wrote %s (%u dls, %u ranges, %llu bytes)",
                      path, (unsigned)g_cap.roots.size(), rangeCount,
                      (unsigned long long)rangeBytes);
+        sysLogPrintf(LOG_NOTE, "census: heap %u blocks / %llu B | rom %u blocks / %llu B "
+                     "| untracked %u refs / %llu B",
+                     g_cap.heapBlocks, (unsigned long long)g_cap.heapBytes,
+                     g_cap.romBlocks, (unsigned long long)g_cap.romBytes,
+                     g_cap.untrackedRefs, (unsigned long long)g_cap.untrackedBytes);
     }
 
     if (!g_cap.goldenRgb.empty()) {
@@ -369,6 +400,8 @@ void flushFrame(void)
 
     g_cap.roots.clear();
     g_cap.ranges.clear();
+    g_cap.heapBlocks = g_cap.romBlocks = g_cap.untrackedRefs = 0;
+    g_cap.heapBytes = g_cap.romBytes = g_cap.untrackedBytes = 0;
     g_cap.goldenRgb.clear();
     g_cap.frameOpen = false;
     ++g_cap.frameIndex;
@@ -452,6 +485,9 @@ extern "C" void pdCaptureArm(const char *pathPrefix, int frames)
         return;
     }
     g_cap.quitWhenDone = sysArgCheck("--capture-quit") != 0;
+    /* Levels spend their first frames on loading screens, which are not
+     * representative. --capture-skip discards that many rendered frames. */
+    g_cap.skipLeft = sysArgGetInt("--capture-skip", 0);
     g_cap.prefix = pathPrefix;
     g_cap.framesLeft = frames;
     g_cap.frameIndex = 0;
@@ -468,6 +504,10 @@ extern "C" int pdCaptureActive(void)
 extern "C" void pdCaptureOnRun(const Gfx *rootDl)
 {
     if (!pdCaptureActive() || !rootDl) {
+        return;
+    }
+    g_cap.sawDl = true;
+    if (g_cap.skipLeft > 0) {
         return;
     }
     g_cap.frameOpen = true;
@@ -495,6 +535,16 @@ extern "C" void pdCaptureEndFrame(void)
     /* Only frames that actually carried a display list count against the
      * budget. The game submits none during loading, and letting those consume
      * frames silently produced short captures. */
+    if (!g_cap.sawDl) {
+        return;
+    }
+    g_cap.sawDl = false;
+
+    if (g_cap.skipLeft > 0) {
+        --g_cap.skipLeft;
+        return;
+    }
+
     if (!g_cap.frameOpen) {
         return;
     }
