@@ -1,0 +1,49 @@
+#ifndef RT64_CAPTURE_H
+#define RT64_CAPTURE_H
+
+/*
+ * C entry points for display-list capture (.pddl files).
+ *
+ * Capture records, per frame, every root display list submitted to gfx_run
+ * plus the contents of every memory block that walk references, at the
+ * original host addresses. A capture is self-contained: the translator and
+ * its tests can be replayed against one with no game running. Format is
+ * documented in rt64_capture.cpp.
+ *
+ * Everything here is a no-op unless capture has been armed, so the hooks can
+ * sit unconditionally in the dispatch layer.
+ */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <PR/gbi.h>
+
+/* Arms capture for the next `frames` frames. Files are written as
+ * <prefix>.NNNN.pddl, with a golden image alongside as <prefix>.NNNN.png.
+ * Called from videoInit when --capture-frames is passed. */
+void pdCaptureArm(const char *pathPrefix, int frames);
+
+/* Called by the dispatch layer for every gfx_run, before the backend sees
+ * the list. Records the display list and everything it references. */
+void pdCaptureOnRun(const Gfx *rootDl);
+
+/* Called by the dispatch layer at the end of each frame; closes the current
+ * .pddl file and decrements the armed frame counter. */
+void pdCaptureEndFrame(void);
+
+/* True while capture is armed. Used by the fast3d path to decide whether to
+ * do the (expensive) golden-image readback. */
+int pdCaptureActive(void);
+
+/* Called from the fast3d path with the rendered native-resolution image,
+ * immediately before the buffer swap. `pixels` is tightly packed RGB8,
+ * bottom-up as glReadPixels returns it. No-op unless armed. */
+void pdCaptureGoldenImage(const unsigned char *pixels, int width, int height);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* RT64_CAPTURE_H */

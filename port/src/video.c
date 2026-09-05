@@ -10,8 +10,10 @@
 #include "video.h"
 
 #include "../fast3d/gfx_api.h"
+#include "../fast3d/gfx_graphics_api.h"
 #include "../fast3d/gfx_sdl.h"
 #include "../fast3d/gfx_opengl.h"
+#include "../rt64/rt64_capture.h"
 
 #ifdef PLATFORM_NSWITCH
 #define DEFAULT_VID_WIDTH 1280
@@ -41,6 +43,7 @@ static s32 vidAllowHiDpi = false;
 static s32 vidVsync = 1;
 static s32 vidMSAA = 1;
 static s32 vidFramerateLimit = 0;
+static s32 vidRenderer = 0; /* 0 = fast3d/OpenGL, 1 = RT64 */
 
 static s32 vidDisplayFPS = 0;
 static f32 vidDisplayFPSInterval = 1.f;
@@ -73,6 +76,22 @@ s32 videoInit(void)
 {
 	wmAPI = &gfx_sdl;
 	renderingAPI = &gfx_opengl_api;
+
+	/* Pick the graphics backend before anything touches gfx_*. --renderer wins
+	 * over the config value; anything unrecognised falls back to fast3d. */
+	const char *rendererArg = sysArgGetString("--renderer");
+	if (rendererArg) {
+		vidRenderer = (strcmp(rendererArg, "rt64") == 0) ? 1 : 0;
+	}
+	gfx_select_backend(vidRenderer ? &gfx_rt64_api : &gfx_fast3d_api);
+	sysLogPrintf(LOG_NOTE, "video: %s backend", gfx_get_backend()->name);
+
+	/* Display-list capture (see port/rt64/rt64_capture.cpp). */
+	const s32 captureFrames = sysArgGetInt("--capture-frames", 0);
+	if (captureFrames > 0) {
+		const char *prefix = sysArgGetString("--capture-prefix");
+		pdCaptureArm(prefix ? prefix : "pdcapture", captureFrames);
+	}
 
 	gfx_current_native_viewport.width = 320;
 	gfx_current_native_viewport.height = 220;
@@ -378,7 +397,7 @@ u32 videoGetAnisotropicFilter()
 
 u32 videoGetMaxAnisotropyLevel()
 {
-	return renderingAPI->get_max_anisotropy_level();
+	return gfx_get_backend()->get_max_anisotropy_level();
 }
 
 s32 videoGetDetailTextures(void)
@@ -466,7 +485,7 @@ void videoSetTextureFilter2D(s32 filter)
 void videoSetAnisotropicFilter(u32 level)
 {
 	texAnisotropicFilter = level;
-	renderingAPI->set_anisotropy_level(level);
+	gfx_get_backend()->set_anisotropy_level(level);
 }
 
 void videoSetDetailTextures(s32 detail)
@@ -577,6 +596,7 @@ PD_CONSTRUCTOR static void videoConfigInit(void)
 	configRegisterInt("Video.FramerateLimit", &vidFramerateLimit, 0, VIDEO_MAX_FPS);
 	configRegisterInt("Video.DisplayFPS", &vidDisplayFPS, 0, 1);
 	configRegisterFloat("Video.DisplayFPSInterval", &vidDisplayFPSInterval, 0.01f, 32.f);
+	configRegisterInt("Video.Renderer", &vidRenderer, 0, 1);
 	configRegisterInt("Video.MSAA", &vidMSAA, 1, 16);
 	configRegisterInt("Video.TextureFilter", &texFilter, 0, 2);
 	configRegisterInt("Video.TextureFilter2D", &texFilter2D, 0, 1);

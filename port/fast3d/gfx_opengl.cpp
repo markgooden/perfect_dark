@@ -1319,3 +1319,23 @@ struct GfxRenderingAPI gfx_opengl_api = {
     gfx_opengl_set_anisotropy_level,
     gfx_opengl_get_max_anisotropy_level
 };
+
+/*
+ * Reads the current default-framebuffer contents as tightly packed RGB8.
+ * Used only by display-list capture to write a golden image alongside each
+ * .pddl (port/rt64/rt64_capture.cpp); never called in normal play.
+ *
+ * glReadPixels returns rows bottom-up, which is what pdCaptureGoldenImage
+ * expects.
+ */
+extern "C" void gfx_opengl_read_default_rgb(int x, int y, int width, int height, unsigned char *out) {
+    if (!out || width <= 0 || height <= 0) {
+        return;
+    }
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(x, y, width, height, GL_RGB, GL_UNSIGNED_BYTE, out);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+}

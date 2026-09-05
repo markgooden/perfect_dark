@@ -30,6 +30,35 @@
 #include "gfx_window_manager_api.h"
 #include "gfx_rendering_api.h"
 #include "gfx_screen_config.h"
+#include "gfx_graphics_api.h"
+#include "../rt64/rt64_capture.h"
+
+/* fast3d's implementation of the GfxGraphicsAPI contract. These were the
+ * gfx_* free functions until T2; they are now reached through the dispatch
+ * table in gfx_api_dispatch.c. Declared up front because several are called
+ * from gfx_run_dl before their definitions. */
+extern "C" {
+void f3d_init(const struct GfxInitSettings *settings);
+void f3d_destroy(void);
+struct GfxRenderingAPI *f3d_get_current_rendering_api(void);
+void f3d_start_frame(void);
+void f3d_run(Gfx *commands);
+void f3d_end_frame(void);
+void f3d_set_target_fps(int fps);
+void f3d_set_texture_filter(enum FilteringMode mode);
+void f3d_set_mipmap_filter(enum MipmapFilteringMode mode);
+void f3d_texture_cache_clear(void);
+void f3d_texture_cache_delete(const uint8_t *orig_addr);
+void f3d_texture_cache_delete_range(const uint8_t *start, const uint8_t *end);
+int  f3d_create_framebuffer(uint32_t width, uint32_t height, int upscale, int autoresize);
+void f3d_resize_framebuffer(int fb, uint32_t width, uint32_t height, int upscale, int autoresize);
+void f3d_set_framebuffer(int fb, float noise_scale);
+void f3d_reset_framebuffer(void);
+void f3d_copy_framebuffer(int fb_dst, int fb_src, int left, int top, int use_back);
+
+/* Implemented in gfx_opengl.cpp; capture-only readback. */
+void gfx_opengl_read_default_rgb(int x, int y, int width, int height, unsigned char *out);
+}
 
 uintptr_t gfxFramebuffer;
 
@@ -206,22 +235,16 @@ static struct RenderingState {
     TextureCacheNode* textures[SHADER_MAX_TEXTURES];
 } rendering_state;
 
-struct GfxDimensions gfx_current_window_dimensions;
+/* The eight globals gfx_api.h declares now live in gfx_api_dispatch.c: they
+ * are shared between backends, not fast3d state. video.c reads seven of them
+ * directly, so a second backend must be able to keep them current. */
 int32_t gfx_current_window_position_x;
 int32_t gfx_current_window_position_y;
-struct GfxDimensions gfx_current_dimensions;
 static struct GfxDimensions gfx_prev_dimensions;
-struct XYWidthHeight gfx_current_game_window_viewport;
-struct XYWidthHeight gfx_current_native_viewport;
-float gfx_current_native_aspect = 4.f / 3.f;
-bool gfx_framebuffers_enabled = true;
-bool gfx_detail_textures_enabled = true;
 
 static bool game_renders_to_framebuffer;
 static int game_framebuffer;
 static int game_framebuffer_msaa_resolved;
-
-uint32_t gfx_msaa_level = 1;
 
 static bool dropped_frame;
 
@@ -506,7 +529,7 @@ static struct ColorCombiner* gfx_lookup_or_create_color_combiner(const ColorComb
     return &prev_combiner->second;
 }
 
-void gfx_texture_cache_clear() {
+void f3d_texture_cache_clear() {
     gfx_flush();
     for (const auto& entry : gfx_texture_cache.map) {
         gfx_texture_cache.free_texture_ids.push_back(entry.second.texture_id);
@@ -556,7 +579,7 @@ static bool gfx_texture_cache_lookup(int i, const TextureCacheKey& key) {
     return false;
 }
 
-void gfx_texture_cache_delete(const uint8_t* orig_addr) {
+void f3d_texture_cache_delete(const uint8_t* orig_addr) {
     gfx_flush();
 
     for (int i = 0; i < 2; ++i) {
@@ -585,7 +608,7 @@ void gfx_texture_cache_delete(const uint8_t* orig_addr) {
     }
 }
 
-void gfx_texture_cache_delete_range(const uint8_t* start, const uint8_t* end) {
+void f3d_texture_cache_delete_range(const uint8_t* start, const uint8_t* end) {
     gfx_flush();
 
     for (int i = 0; i < 2; ++i) {
@@ -2489,24 +2512,24 @@ static void gfx_run_dl(Gfx* cmd) {
                 gfx_flush();
                 if (cmd->words.w1) {
                     // don't care about noise here
-                    gfx_set_framebuffer(cmd->words.w1, 1.f);
+                    f3d_set_framebuffer(cmd->words.w1, 1.f);
                     fbActive = true;
                 } else {
-                    gfx_reset_framebuffer();
+                    f3d_reset_framebuffer();
                     fbActive = false;
                 }
                 break;
             case G_COPYFB_EXT:
-                gfx_copy_framebuffer(C0(11, 11), C0(0, 11), (int16_t)C1(16, 16), (int16_t)C1(0, 16), C0(22, 1));
+                f3d_copy_framebuffer(C0(11, 11), C0(0, 11), (int16_t)C1(16, 16), (int16_t)C1(0, 16), C0(22, 1));
                 break;
             case G_RDPSETOTHERMODE:
                 gfx_dp_set_other_mode(C0(0, 24), cmd->words.w1);
                 break;
             case G_INVALTEXCACHE_EXT:
                 if (cmd->words.w1) {
-                    gfx_texture_cache_delete((const uint8_t *)seg_addr(cmd->words.w1));
+                    f3d_texture_cache_delete((const uint8_t *)seg_addr(cmd->words.w1));
                 } else {
-                    gfx_texture_cache_clear();
+                    f3d_texture_cache_clear();
                 }
                 break;
             case (uint8_t)G_RDPHALF_1:
@@ -2546,7 +2569,7 @@ extern "C" void gfx_get_dimensions(uint32_t* width, uint32_t* height, int32_t* p
     gfx_wapi->get_dimensions(width, height, posX, posY);
 }
 
-extern "C" void gfx_init(const GfxInitSettings *settings) {
+extern "C" void f3d_init(const GfxInitSettings *settings) {
     gfx_wapi = settings->wapi;
     gfx_rapi = settings->rapi;
     gfx_wapi->init(&settings->window_settings);
@@ -2578,18 +2601,18 @@ extern "C" void gfx_init(const GfxInitSettings *settings) {
     rsp.lookat_enabled = true;
 }
 
-extern "C" void gfx_destroy(void) {
+extern "C" void f3d_destroy(void) {
     // TODO: should also destroy rapi and wapi, and any other resources acquired in fast3d
 
     // Texture cache and loaded textures store references to Resources which need to be unreferenced.
-    gfx_texture_cache_clear();
+    f3d_texture_cache_clear();
 }
 
-extern "C" struct GfxRenderingAPI* gfx_get_current_rendering_api(void) {
+extern "C" struct GfxRenderingAPI* f3d_get_current_rendering_api(void) {
     return gfx_rapi;
 }
 
-extern "C" void gfx_start_frame(void) {
+extern "C" void f3d_start_frame(void) {
     gfx_wapi->handle_events();
     gfx_wapi->get_dimensions(&gfx_current_window_dimensions.width, &gfx_current_window_dimensions.height,
                              &gfx_current_window_position_x, &gfx_current_window_position_y);
@@ -2660,7 +2683,7 @@ extern "C" void gfx_start_frame(void) {
 
 uint32_t num_dls = 0;
 
-extern "C" void gfx_run(Gfx* commands) {
+extern "C" void f3d_run(Gfx* commands) {
     ++num_dls;
     gfx_sp_reset();
 
@@ -2706,22 +2729,35 @@ extern "C" void gfx_run(Gfx* commands) {
     }
 
     gfx_rapi->end_frame();
+
+    /* Golden image for display-list capture, read before the swap while the
+     * default framebuffer still holds this frame. No-op unless armed. */
+    if (pdCaptureActive()) {
+        const int w = (int)gfx_current_window_dimensions.width;
+        const int h = (int)gfx_current_window_dimensions.height;
+        if (w > 0 && h > 0) {
+            std::vector<unsigned char> rgb((size_t)w * (size_t)h * 3);
+            gfx_opengl_read_default_rgb(0, 0, w, h, rgb.data());
+            pdCaptureGoldenImage(rgb.data(), w, h);
+        }
+    }
+
     gfx_wapi->swap_buffers_begin();
 }
 
-extern "C" void gfx_end_frame(void) {
+extern "C" void f3d_end_frame(void) {
     if (!dropped_frame) {
         gfx_rapi->finish_render();
         gfx_wapi->swap_buffers_end();
     }
 }
 
-extern "C" void gfx_set_target_fps(int fps) {
+extern "C" void f3d_set_target_fps(int fps) {
     gfx_wapi->set_target_fps(fps);
 }
 
 extern "C" void reset_texture_state() {
-    gfx_texture_cache_clear();
+    f3d_texture_cache_clear();
     if (rendering_state.shader_program) {
         gfx_rapi->unload_shader(rendering_state.shader_program);
         rendering_state.shader_program = nullptr;
@@ -2731,23 +2767,23 @@ extern "C" void reset_texture_state() {
     prev_combiner = color_combiner_pool.end();
 }
 
-extern "C" void gfx_set_texture_filter(enum FilteringMode mode) {
+extern "C" void f3d_set_texture_filter(enum FilteringMode mode) {
     reset_texture_state();
     gfx_rapi->set_texture_filter(mode);
 }
 
-extern "C" void gfx_set_mipmap_filter(enum MipmapFilteringMode mode) {
+extern "C" void f3d_set_mipmap_filter(enum MipmapFilteringMode mode) {
     reset_texture_state();
     gfx_rapi->set_mipmap_filter(mode);
 }
 
-extern "C" int gfx_create_framebuffer(uint32_t width, uint32_t height, int upscale, int autoresize) {
+extern "C" int f3d_create_framebuffer(uint32_t width, uint32_t height, int upscale, int autoresize) {
     int fb = gfx_rapi->create_framebuffer();
-    gfx_resize_framebuffer(fb, width, height, upscale, autoresize);
+    f3d_resize_framebuffer(fb, width, height, upscale, autoresize);
     return fb;
 }
 
-extern "C" void gfx_resize_framebuffer(int fb, uint32_t width, uint32_t height, int upscale, int autoresize) {
+extern "C" void f3d_resize_framebuffer(int fb, uint32_t width, uint32_t height, int upscale, int autoresize) {
     uint32_t orig_width, orig_height;
 
     if (width && height) {
@@ -2770,13 +2806,13 @@ extern "C" void gfx_resize_framebuffer(int fb, uint32_t width, uint32_t height, 
     framebuffers[fb] = { orig_width, orig_height, width, height, (bool)upscale, (bool)autoresize };
 }
 
-extern "C" void gfx_set_framebuffer(int fb, float noise_scale) {
+extern "C" void f3d_set_framebuffer(int fb, float noise_scale) {
     gfx_rapi->start_draw_to_framebuffer(fb, noise_scale);
     gfx_rapi->clear_framebuffer(true, true);
     active_fb = framebuffers.find(fb);
 }
 
-extern "C" void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top, int use_back) {
+extern "C" void f3d_copy_framebuffer(int fb_dst, int fb_src, int left, int top, int use_back) {
     const bool is_main_fb = (fb_src == 0);
 
     if (is_main_fb) {
@@ -2796,7 +2832,43 @@ extern "C" void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top, 
     gfx_rapi->copy_framebuffer(fb_dst, fb_src, left, top, is_main_fb, (bool)use_back);
 }
 
-extern "C" void gfx_reset_framebuffer(void) {
+extern "C" void f3d_reset_framebuffer(void) {
     gfx_rapi->start_draw_to_framebuffer(0, (float)gfx_current_dimensions.height / SCREEN_HEIGHT);
     active_fb = framebuffers.end();
 }
+
+/*
+ * Anisotropy passthroughs. video.c used to reach these by dereferencing the
+ * GfxRenderingAPI directly (video.c:381,469); they are part of the backend
+ * contract now so video.c never needs a rapi pointer.
+ */
+extern "C" int f3d_get_max_anisotropy_level(void) {
+    return gfx_rapi->get_max_anisotropy_level();
+}
+
+extern "C" void f3d_set_anisotropy_level(int level) {
+    gfx_rapi->set_anisotropy_level(level);
+}
+
+extern "C" const struct GfxGraphicsAPI gfx_fast3d_api = {
+    "fast3d",
+    f3d_init,
+    f3d_destroy,
+    f3d_get_current_rendering_api,
+    f3d_start_frame,
+    f3d_run,
+    f3d_end_frame,
+    f3d_set_target_fps,
+    f3d_set_texture_filter,
+    f3d_set_mipmap_filter,
+    f3d_texture_cache_clear,
+    f3d_texture_cache_delete,
+    f3d_texture_cache_delete_range,
+    f3d_create_framebuffer,
+    f3d_resize_framebuffer,
+    f3d_set_framebuffer,
+    f3d_reset_framebuffer,
+    f3d_copy_framebuffer,
+    f3d_get_max_anisotropy_level,
+    f3d_set_anisotropy_level,
+};
