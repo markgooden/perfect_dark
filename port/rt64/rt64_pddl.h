@@ -10,8 +10,8 @@
  * writer so the two halves of the format sit in one directory and share
  * kPddlVersion rather than drifting apart.
  *
- * The port's CMakeLists globs port/*.cpp (CMakeLists.txt:261), so this does
- * get compiled into the game even though the game never reads a capture back.
+ * The port's CMakeLists globs every .cpp under port (CMakeLists.txt:261), so
+ * this does get compiled into the game even though it never reads a capture.
  * That is harmless - nothing calls it, and the linker drops it - but do not
  * write code here that assumes otherwise.
  *

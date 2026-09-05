@@ -122,15 +122,26 @@ uint32_t gfxCommandWords(uint8_t opcode)
     }
 }
 
-uintptr_t gfxSegResolve(uintptr_t w1, const uintptr_t segments[16])
+uintptr_t gfxSegResolve(uintptr_t w1, const uintptr_t segments[16],
+                        bool *outUnbound)
 {
+    if (outUnbound) {
+        *outUnbound = false;
+    }
+
     /* gfx_pc.cpp:2285-2296. Segment 0 is reserved and does not count. */
     if (w1 & 1) {
         const uintptr_t seg = (w1 & 0x0f000000) >> 24;
         if (seg && segments[seg]) {
             return segments[seg] + (w1 & 0x00fffffe);
         }
-        return 0;
+        /* fast3d falls through and dereferences w1 as a pointer. Reproduce it:
+         * a capture that recorded something else would disagree with the
+         * renderer about what the frame touched, which is the one thing it
+         * exists to get right. */
+        if (outUnbound) {
+            *outUnbound = true;
+        }
     }
     return w1;
 }
@@ -173,7 +184,7 @@ GfxRef gfxStep(GfxWalkState &st, const Gfx *cmd)
             ref.segment = (uint8_t)((g.words.w1 & 0x0f000000) >> 24);
             ref.segOffset = (uint32_t)(g.words.w1 & 0x00fffffe);
         }
-        ref.addr = gfxSegResolve((uintptr_t)g.words.w1, st.segments);
+        ref.addr = gfxSegResolve((uintptr_t)g.words.w1, st.segments, &ref.unbound);
     };
 
     switch (opcode) {
@@ -407,11 +418,29 @@ struct PortDisasm {
      * more informative than the zero it resolved to. */
     std::string refName(const GfxRef &r, uint32_t len)
     {
+        /* An unbound segment is the one case where the resolved address is a
+         * wild pointer fast3d would dereference. Naming the segment is both
+         * stable and the more useful thing to see. */
+        if (r.unbound) {
+            return fmt("seg[%u]+0x%x <unbound>", r.segment, r.segOffset);
+        }
         if (!r.addr) {
-            return r.segmented ? fmt("seg[%u]+0x%x", r.segment, r.segOffset)
-                               : std::string("null");
+            return "null";
         }
         return namer.name(r.addr, len, mem.regionOf(r.addr, len ? len : 1));
+    }
+
+    /* Same, for the commands whose w1 is an address the walker does not model
+     * as a GfxRef (image and cache-invalidation targets). */
+    std::string addrName(uintptr_t w1)
+    {
+        bool unbound = false;
+        const uintptr_t a = gfxSegResolve(w1, st.segments, &unbound);
+        if (unbound) {
+            return fmt("seg[%u]+0x%x <unbound>", (unsigned)((w1 & 0x0f000000) >> 24),
+                       (unsigned)(w1 & 0x00fffffe));
+        }
+        return a ? namer.name(a, 1, mem.regionOf(a, 1)) : std::string("null");
     }
 
     /* `name size hash` for a referenced payload - never the bytes themselves
@@ -422,7 +451,7 @@ struct PortDisasm {
     {
         const uint32_t total = r.startOffset + r.bytes;
         const std::string nm = refName(r, total);
-        if (!opts.hashPayloads || !r.addr || !total) {
+        if (!opts.hashPayloads || !r.addr || r.unbound || !total) {
             return nm;
         }
         scratch.resize(total);
@@ -599,9 +628,7 @@ void PortDisasm::walk(uintptr_t at, int depth)
             /* gfx_pc.cpp:2381 */
             f = fmt("fmt=%u siz=%u width=%u img=%s", c0(g[0], 21, 3),
                     c0(g[0], 19, 2), c0(g[0], 0, 10) + 1,
-                    st.texAddr
-                        ? namer.name(st.texAddr, 1, mem.regionOf(st.texAddr, 1)).c_str()
-                        : "null");
+                    addrName((uintptr_t)g[0].words.w1).c_str());
             break;
 
         case (uint8_t)G_LOADBLOCK:
@@ -718,13 +745,10 @@ void PortDisasm::walk(uintptr_t at, int depth)
             break;
 
         case (uint8_t)G_SETZIMG:
-        case (uint8_t)G_SETCIMG: {
+        case (uint8_t)G_SETCIMG:
             /* gfx_pc.cpp:2507,2510 */
-            const uintptr_t img = gfxSegResolve((uintptr_t)g[0].words.w1, st.segments);
-            f = fmt("img=%s", img ? namer.name(img, 1, mem.regionOf(img, 1)).c_str()
-                                  : "null");
+            f = fmt("img=%s", addrName((uintptr_t)g[0].words.w1).c_str());
             break;
-        }
 
         case G_SETFB_EXT:
             /* gfx_pc.cpp:2513-2522: w1 is a framebuffer id, not an address. */
@@ -743,13 +767,11 @@ void PortDisasm::walk(uintptr_t at, int depth)
                     (int16_t)c1(g[0], 0, 16), c0(g[0], 22, 1));
             break;
 
-        case G_INVALTEXCACHE_EXT: {
+        case G_INVALTEXCACHE_EXT:
             /* gfx_pc.cpp:2530-2535: null clears the whole cache. */
-            const uintptr_t tex = gfxSegResolve((uintptr_t)g[0].words.w1, st.segments);
-            f = tex ? fmt("tex=%s", namer.name(tex, 1, mem.regionOf(tex, 1)).c_str())
-                    : std::string("clear-all");
+            f = g[0].words.w1 ? fmt("tex=%s", addrName((uintptr_t)g[0].words.w1).c_str())
+                              : std::string("clear-all");
             break;
-        }
 
         case G_SETGRAYSCALE_EXT:
             f = fmt("on=%u", (uint32_t)g[0].words.w1);
@@ -786,9 +808,9 @@ void PortDisasm::walk(uintptr_t at, int depth)
         }
 
         if (opcode == G_DL) {
-            if (!ref.addr) {
-                /* fast3d skips a null call and would branch to garbage; do
-                 * neither, and leave the reason in the dump. */
+            if (!ref.addr || ref.unbound) {
+                /* fast3d skips a null call and would branch through an unbound
+                 * segment into garbage; do neither, and say why in the dump. */
                 out += "  <unresolved display list, not followed>\n";
                 if (c0(g[0], 16, 1)) {
                     return;

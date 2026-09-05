@@ -84,9 +84,11 @@ enum class RefKind : uint8_t {
 struct GfxRef {
     RefKind kind = RefKind::None;
 
-    /* Segment-resolved host address, or 0 when `segmented` is set and the
-     * segment is unbound. Zero with kind != None means "referenced but not
-     * resolvable": read nothing from it. */
+    /* Segment-resolved host address, exactly as fast3d's seg_addr computes it
+     * - including its fallthrough, where an unbound segment yields the raw w1
+     * rather than nothing (gfx_pc.cpp:2285-2296). Anything that records what
+     * the renderer touched must use this value and no other; `unbound` below
+     * is how a consumer that should not dereference it finds out. */
     uintptr_t addr = 0;
 
     /* Bytes the renderer reads at `addr + startOffset`. Texture loads read a
@@ -101,6 +103,12 @@ struct GfxRef {
     bool segmented = false;
     uint8_t segment = 0;
     uint32_t segOffset = 0;
+
+    /* Segmented, but the segment was never bound. fast3d dereferences the raw
+     * w1 in that case, which is a wild pointer; `addr` reports it faithfully
+     * because the capture must record what the renderer read, but nothing
+     * should follow it without deciding that deliberately. */
+    bool unbound = false;
 };
 
 /*
@@ -137,10 +145,12 @@ struct GfxWalkState {
  */
 GfxRef gfxStep(GfxWalkState &st, const Gfx *cmd);
 
-/* fast3d's seg_addr (gfx_pc.cpp:2285-2296): the port flags segmented
- * addresses with the low bit set, everything else is a raw host pointer.
- * Returns 0 for a segmented reference whose segment is unbound. */
-uintptr_t gfxSegResolve(uintptr_t w1, const uintptr_t segments[16]);
+/* fast3d's seg_addr (gfx_pc.cpp:2285-2296): the port flags segmented addresses
+ * with the low bit set, everything else is a raw host pointer. Mirrors the
+ * fallthrough too - an unbound segment yields w1 unchanged, which is what
+ * fast3d then dereferences. `outUnbound`, when given, reports that case. */
+uintptr_t gfxSegResolve(uintptr_t w1, const uintptr_t segments[16],
+                        bool *outUnbound = nullptr);
 
 /*
  * === Hashing ===

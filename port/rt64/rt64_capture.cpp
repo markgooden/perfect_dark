@@ -47,6 +47,7 @@
 #include <PR/ultratypes.h>
 
 #include "rt64_capture.h"
+#include "rt64_debug.h"
 #include "rt64_pddl.h"
 
 extern "C" {
@@ -106,11 +107,6 @@ struct CaptureState {
     uint32_t executedCount = 0;
     uintptr_t seedSegments[16] = {};
 
-    /* Mirrors rdp.texture_to_load so load commands can size the block. */
-    uintptr_t texAddr = 0;
-    uint32_t texSiz = 0;
-    uint32_t texWidth = 0;
-
     /* Census (T3-lite): per-region accounting of what the frame referenced.
      * "malloc" is the port's tracked allocations (room graphics data);
      * "untracked" is anything left over, which should be zero and is a gap
@@ -134,18 +130,12 @@ struct CaptureState {
 
 CaptureState g_cap;
 
-/* Same resolution as fast3d's seg_addr (gfx_pc.cpp:2285-2296). The port flags
- * segmented addresses with the low bit set; anything else is a raw host
- * pointer. `segments` is whichever table the caller is executing against. */
+/* fast3d's seg_addr, including its fallthrough for an unbound segment
+ * (gfx_pc.cpp:2285-2296). Lives in rt64_debug.cpp so the disassembler and this
+ * file cannot resolve an address two different ways. */
 void *segAddr(uintptr_t w1, const uintptr_t *segments)
 {
-    if (w1 & 1) {
-        const uintptr_t seg = (w1 & 0x0f000000) >> 24;
-        if (seg && segments[seg]) {
-            return (void *)(segments[seg] + (w1 & 0x00fffffe));
-        }
-    }
-    return (void *)w1;
+    return (void *)pdrt64::gfxSegResolve(w1, segments);
 }
 
 /*
@@ -290,105 +280,39 @@ bool isKnownOpcode(uint8_t op)
     }
 }
 
-/* Number of Gfx words each opcode consumes, mirroring gfx_run_dl's ++cmd
- * behaviour for the multi-word commands. */
-uint32_t commandWords(uint8_t opcode)
-{
-    switch (opcode) {
-    case G_TEXRECT:
-    case G_TEXRECTFLIP:
-    case G_TEXRECT_WIDE_EXT:
-    case G_IMAGERECT_EXT:
-        return 3;
-    case G_FILLRECT_WIDE_EXT:
-        return 2;
-    default:
-        return 1;
-    }
-}
-
-void recordTextureLoad(uint32_t sizeBytes, uint32_t startOffset)
-{
-    if (g_cap.texAddr) {
-        recordRange(g_cap.texAddr, (size_t)startOffset + sizeBytes);
-    }
-}
+/*
+ * Interpreter state gfxStep needs: the pending G_SETTIMG that sizes the next
+ * texture load. Segments live here too but are overwritten from fast3d's live
+ * table at every command - see recordCommand.
+ */
+pdrt64::GfxWalkState g_walk;
 
 /*
  * Records one command and the data it references. Called from fast3d for
  * every command it executes; control flow (G_DL, G_ENDDL) and segment
  * bindings (G_MOVEWORD) are the interpreter's business and need nothing here
  * beyond the command bytes themselves.
+ *
+ * What a command spans and what it references are gfxStep's to say
+ * (rt64_debug.h), not this file's. The disassembler hashes exactly the ranges
+ * recorded here, so if these two ever sized a block differently, a golden
+ * replayed from a capture would read bytes the capture never stored and
+ * report misses that mean nothing. One function, no second opinion.
  */
 void recordCommand(const Gfx *cmd, const uintptr_t *segments)
 {
     const uint8_t opcode = (uint8_t)(cmd->words.w0 >> 24);
-    recordRange((uintptr_t)cmd, sizeof(Gfx) * commandWords(opcode));
+    recordRange((uintptr_t)cmd, sizeof(Gfx) * pdrt64::gfxCommandWords(opcode));
 
-    switch (opcode) {
-    case G_MTX:
-        recordRange((uintptr_t)segAddr(cmd->words.w1, segments), sizeof(Mtx));
-        break;
+    /* fast3d hands us the table it is about to resolve against, so the capture
+     * cannot disagree with the renderer about where a reference points. That
+     * is stronger than the bindings gfxStep would infer from the stream, so it
+     * wins. */
+    memcpy(g_walk.segments, segments, sizeof(g_walk.segments));
 
-    case G_MOVEMEM:
-        /* Lights, viewport and lookat blocks are all 16 bytes (sizeof(Light),
-         * sizeof(Vp)), and that is the most fast3d reads (gfx_sp_movemem).
-         * These can sit in small malloc'd blocks, so no rounding up. */
-        recordRange((uintptr_t)segAddr(cmd->words.w1, segments), 16);
-        break;
-
-    case G_VTX:
-    case G_COL: {
-        /* gSPVertex packs sizeof(Vtx)*n and gSPColor sizeof(Col)*n into
-         * w0[0:16] (gbi.h:1722, gbiex.h:15-16). */
-        const uint32_t bytes = C0(cmd, 0, 16);
-        recordRange((uintptr_t)segAddr(cmd->words.w1, segments), bytes);
-        break;
-    }
-
-    case G_SETTIMG:
-        g_cap.texSiz = C0(cmd, 19, 2);
-        g_cap.texWidth = C0(cmd, 0, 10);
-        g_cap.texAddr = (uintptr_t)segAddr(cmd->words.w1, segments);
-        break;
-
-    case G_LOADBLOCK: {
-        /* gfx_pc.cpp:1876 - lrs is a texel count. */
-        const uint32_t lrs = C1(cmd, 12, 12);
-        recordTextureLoad(((lrs + 1) << g_cap.texSiz) >> 1, 0);
-        break;
-    }
-
-    case G_LOADTILE: {
-        /* gfx_pc.cpp:1900-1912 */
-        const uint32_t uls = C0(cmd, 12, 12), ult = C0(cmd, 0, 12);
-        const uint32_t lrs = C1(cmd, 12, 12), lrt = C1(cmd, 0, 12);
-        const uint32_t offsetX = uls >> G_TEXTURE_IMAGE_FRAC;
-        const uint32_t offsetY = ult >> G_TEXTURE_IMAGE_FRAC;
-        const uint32_t tileW = ((lrs - uls) >> G_TEXTURE_IMAGE_FRAC) + 1;
-        const uint32_t tileH = ((lrt - ult) >> G_TEXTURE_IMAGE_FRAC) + 1;
-        const uint32_t fullW = g_cap.texWidth + 1;
-        const uint32_t offsetXBytes = (offsetX << g_cap.texSiz) >> 1;
-        const uint32_t tileLine = (tileW << g_cap.texSiz) >> 1;
-        const uint32_t fullLine = (fullW << g_cap.texSiz) >> 1;
-        recordTextureLoad(tileLine * tileH, fullLine * offsetY + offsetXBytes);
-        break;
-    }
-
-    case G_LOADTLUT: {
-        /* gfx_pc.cpp:1843-1847; entries are 16-bit. */
-        const uint32_t uls = C0(cmd, 14, 10), ult = C0(cmd, 2, 10);
-        const uint32_t lrs = C1(cmd, 14, 10), lrt = C1(cmd, 2, 10);
-        const uint32_t width = lrs - uls + 1;
-        const uint32_t height = lrt - ult + 1;
-        const uint32_t pitch = g_cap.texWidth + 1;
-        const uint32_t entries = pitch * ult + uls + width * height;
-        recordTextureLoad(entries * 2, 0);
-        break;
-    }
-
-    default:
-        break;
+    const pdrt64::GfxRef ref = pdrt64::gfxStep(g_walk, cmd);
+    if (ref.kind != pdrt64::RefKind::None && ref.kind != pdrt64::RefKind::DisplayList) {
+        recordRange(ref.addr, (size_t)ref.startOffset + ref.bytes);
     }
 }
 
@@ -516,7 +440,7 @@ void verifyWalkDl(VerifyState &vs, const Gfx *cmd, int depth)
             break;
         }
 
-        cmd += commandWords(opcode);
+        cmd += pdrt64::gfxCommandWords(opcode);
     }
 }
 
