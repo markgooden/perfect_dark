@@ -943,6 +943,15 @@ bool decodeCanonicalCmd(const uint8_t *rdramBase, RdramAddr at, size_t rdramSize
         return true;
     }
 
+    case 0xB3: /* G_RDPHALF_2, rt64_gbi_f3d.cpp:166 */
+    case 0xB4: /* G_RDPHALF_1, rt64_gbi_f3d.cpp:162. Also the operand words of
+                * a texture rectangle, which texrect consumes itself rather
+                * than dispatching (rt64_gbi_rdp.cpp:177-184) - it reads only
+                * w1, so that is the single field. */
+        out->fields[0] = w1;
+        out->fieldCount = 1;
+        return true;
+
     case 0xB6: /* G_CLEARGEOMETRYMODE */
     case 0xB7: /* G_SETGEOMETRYMODE, rt64_gbi_f3d.cpp */
         out->fields[0] = w1;

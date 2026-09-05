@@ -4,10 +4,26 @@
  * Display-list translator: the port's widened 64-bit Gfx dialect in, the
  * 8-byte-per-command stream RT64's F3DPD + extended GBI understands out.
  *
- * Scope of this file today is SCAFFOLD task T5 - control flow and geometry.
- * The RDP and texture path is T6. Everything outside T5's set is dropped and
- * counted per opcode rather than guessed at, so a golden shows exactly what is
- * translated and what is still missing. See kDisposition in the .cpp.
+ * Scope of this file today is SCAFFOLD tasks T5 (control flow and geometry)
+ * and T6 (the RDP and texture path). The EXT dialect is T7. Everything outside
+ * that is dropped and counted per opcode rather than guessed at, so a golden
+ * shows exactly what is translated and what is still missing. See
+ * dispositionOf in the .cpp.
+ *
+ * === Deferred texture sizing (T6) ===
+ *
+ * A G_SETTIMG names a texture image but carries no size; only the
+ * G_LOADBLOCK/G_LOADTILE/G_LOADTLUT that follows says how much of it the
+ * renderer reads. So the command is emitted immediately with a placeholder
+ * address and patched when a load arrives - emitting it late instead would
+ * reorder it past the G_SETTILE that normally sits between them, and RT64
+ * needs the image bound before the load. Several loads may follow one
+ * G_SETTIMG; the block grows to cover the largest, and since its base never
+ * moves the earlier loads keep reading the right bytes.
+ *
+ * Texture and TLUT blocks are the only ones cached. Their extents are byte
+ * counts and need not be a whole number of words, so a short final word is
+ * zero-padded rather than read past - see PaddedReader in the .cpp.
  *
  * === What the output looks like ===
  *
@@ -112,6 +128,18 @@ struct TranslateStats {
     uint32_t droppedExtraGeometryFlags = 0;
     uint64_t marshalledBytes = 0;
     double translateMs = 0.0;
+
+    /* Texture and TLUT blocks, which are the only ones cached (T6). A static
+     * scene should be all hits from its second frame; a rising miss count
+     * frame after frame means the cache key or its invalidation is wrong. */
+    uint32_t textureBlocks = 0;
+    uint32_t textureCacheHits = 0;
+    uint32_t textureCacheMisses = 0;
+
+    /* G_SETTIMG commands no load command ever sized. Their emitted address
+     * stays a placeholder, which is harmless - RT64 only stores it - but a
+     * nonzero count means the deferred-sizing assumption needs revisiting. */
+    uint32_t unsizedImages = 0;
 };
 
 /*
@@ -157,8 +185,22 @@ private:
     void emitStreamPrefix();
 
     /* Marshals a referenced block into the arena and returns its tagged
-     * address. Returns false and sets the error on a capture miss. */
-    bool pushBlock(const GfxRef &ref, Swizzle type, RdramAddr *out);
+     * address. Returns false and sets the error on a capture miss.
+     *
+     * `cached` selects the persistent region. Only texture and TLUT blocks
+     * set it: their source is immutable until the game says otherwise, and it
+     * says so through the texture-cache calls that drive
+     * Arena::invalidateCache. That is the same contract fast3d's own texture
+     * cache runs on - it keys on the source pointer too (gfx_pc.h:23-28) and
+     * is invalidated by the same calls - so this is no more of an assumption
+     * than the renderer we are matching already makes. Vertices, matrices,
+     * colours and movemem blocks are NOT cached: they live in heap the game
+     * rewrites between frames with no notification (docs/census.md). */
+    bool pushBlock(const GfxRef &ref, Swizzle type, bool cached, RdramAddr *out);
+
+    /* Marshals a texture or TLUT block and patches the address into the
+     * G_SETTIMG that named it. Returns false only on a capture miss. */
+    bool sizePendingImage(const GfxRef &ref);
 
     TranslateStatus walk(uintptr_t at, int depth);
     bool validateEmitted(size_t pairIndex, const DecodedCmd &expect);
@@ -166,6 +208,30 @@ private:
     Arena &arena_;
     FbRegistry &fbs_;
     MemReader &mem_;
+
+    /*
+     * A G_SETTIMG whose block size is not yet known.
+     *
+     * The command names a texture image but nothing in it says how big that
+     * image is; only the G_LOADBLOCK/G_LOADTILE/G_LOADTLUT that follows gives
+     * a size (rt64_capture.cpp derives it the same way). So the command is
+     * emitted straight away with a placeholder address and patched once a load
+     * arrives - emitting it late instead would reorder it past the G_SETTILE
+     * that normally sits between the two, and RT64 needs the image set before
+     * the load.
+     *
+     * Several loads can follow one G_SETTIMG. Each is checked against the
+     * extent already marshalled and the block is grown if needed, so the final
+     * address covers every load - and because the base never moves, the
+     * earlier loads still read the right bytes.
+     */
+    struct PendingImage {
+        size_t pairIndex = 0;    // index of the SETTIMG w0 within out_
+        bool valid = false;
+        uintptr_t src = 0;
+        size_t marshalledLen = 0;
+    };
+    PendingImage pendingImage_;
 
     GfxWalkState st_;
     std::vector<uint32_t> out_;   // emitted words, flushed to the arena at end

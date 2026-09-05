@@ -1,5 +1,6 @@
 /*
- * Display-list translator, T5 scope: control flow and geometry.
+ * Display-list translator, T5 and T6 scope: control flow, geometry, and the
+ * RDP and texture path.
  * Contract, dialect differences and swizzle reasoning are in rt64_translate.h.
  *
  * Every lowering below cites the RT64 decoder it must satisfy. That is not
@@ -35,6 +36,8 @@ constexpr uint8_t kCanonMoveMem = 0x03;
 constexpr uint8_t kCanonVtx = 0x04;
 constexpr uint8_t kCanonVtxColorPD = 0x07;
 constexpr uint8_t kCanonTriX = 0xB1;
+constexpr uint8_t kCanonRdpHalf2 = 0xB3;
+constexpr uint8_t kCanonRdpHalf1 = 0xB4;
 constexpr uint8_t kCanonClearGeometryMode = 0xB6;
 constexpr uint8_t kCanonSetGeometryMode = 0xB7;
 constexpr uint8_t kCanonEndDl = 0xB8;
@@ -63,6 +66,58 @@ inline uint32_t fieldOf(const Gfx &g, uint32_t pos, uint32_t width)
     return (uint32_t)((g.words.w0 >> pos) & ((1ULL << width) - 1));
 }
 
+/*
+ * Serves a source block, zero-filling past its true end.
+ *
+ * Texture and TLUT extents are byte counts derived from a load command and are
+ * not always a multiple of four - `((lrs + 1) << siz) >> 1` is odd for plenty
+ * of real textures. marshalCopy needs a whole number of words, because BE32
+ * reverses bytes within each word and a partial trailing word has no defined
+ * mapping (rt64_mem.h).
+ *
+ * Rounding the read up instead would be wrong twice over: the extra bytes may
+ * lie outside what the capture recorded, and in the running game they may lie
+ * outside the allocation, which is a genuine overread. So the length is rounded
+ * up and the bytes past the end are supplied as zero. They belong to a texel
+ * outside the loaded region, which the renderer does not sample.
+ */
+class PaddedReader final : public MemReader {
+public:
+    PaddedReader(MemReader &inner, uintptr_t base, size_t trueLen)
+        : inner_(inner), base_(base), trueLen_(trueLen)
+    {
+    }
+
+    bool read(uintptr_t src, void *dst, size_t len) override
+    {
+        const size_t offset = src - base_;
+        const size_t real = offset < trueLen_ ? trueLen_ - offset : 0;
+        const size_t take = len < real ? len : real;
+        if (take && !inner_.read(src, dst, take)) {
+            return false;
+        }
+        if (take < len) {
+            memset((uint8_t *)dst + take, 0, len - take);
+        }
+        return true;
+    }
+
+    Region regionOf(uintptr_t src, size_t len) const override
+    {
+        return inner_.regionOf(src, len < trueLen_ ? len : trueLen_);
+    }
+
+private:
+    MemReader &inner_;
+    uintptr_t base_;
+    size_t trueLen_;
+};
+
+constexpr size_t roundUp4(size_t n)
+{
+    return (n + 3u) & ~(size_t)3u;
+}
+
 /* An address is only legal in the output if it is tagged, aligned and free of
  * the port's flag bits (invariant 4). */
 bool addressIsWellFormed(RdramAddr a, size_t arenaSize)
@@ -86,6 +141,7 @@ void Translator::beginFrame()
 {
     st_.reset();
     invertCulling_ = false;
+    pendingImage_ = PendingImage{};
     stats_ = TranslateStats{};
     error_.clear();
 }
@@ -109,7 +165,7 @@ void Translator::emitStreamPrefix()
     emit(((uint32_t)kExtendedOpcode << 24) | kGexSetRdramExtendedV1, 1u);
 }
 
-bool Translator::pushBlock(const GfxRef &ref, Swizzle type, RdramAddr *out)
+bool Translator::pushBlock(const GfxRef &ref, Swizzle type, bool cached, RdramAddr *out)
 {
     const size_t len = (size_t)ref.startOffset + ref.bytes;
     if (!ref.addr || !len || ref.unbound) {
@@ -134,14 +190,72 @@ bool Translator::pushBlock(const GfxRef &ref, Swizzle type, RdramAddr *out)
         return false;
     }
 
-    /* Nothing is cached at this scope. The arena's cache has no invalidation
-     * beyond the texture-cache hooks and clearCache, while the heap blocks
-     * these commands point at are rewritten between frames (docs/census.md),
-     * so a cache keyed on source address would serve stale geometry. Textures
-     * and TLUTs are the blocks with a real caching case and they arrive in
-     * T6, together with the hooks that invalidate them. */
+    if (cached) {
+        /* Texture extents are byte counts and need not be a whole number of
+         * words; PaddedReader supplies the shortfall as zero rather than
+         * reading past the block. The cache key becomes (src, padded length,
+         * type), which is still an exact identity for the marshalled result. */
+        const size_t padded = roundUp4(len);
+        PaddedReader reader(mem_, ref.addr, len);
+
+        /* Ask the arena whether this was already marshalled by comparing its
+         * hit counter across the call. Arena has no "contains" query and this
+         * needs no new API surface to answer the question T6's acceptance
+         * asks: is a static scene all cache hits by its second frame. */
+        const uint32_t hitsBefore = arena_.stats().cacheHits;
+        *out = arena_.pushCachedData(reader, ref.addr, padded, type);
+        ++stats_.textureBlocks;
+        if (arena_.stats().cacheHits != hitsBefore) {
+            ++stats_.textureCacheHits;
+        } else {
+            ++stats_.textureCacheMisses;
+            stats_.marshalledBytes += padded;
+        }
+        return true;
+    }
+
     *out = arena_.pushFrameData(mem_, ref.addr, len, type);
     stats_.marshalledBytes += len;
+    return true;
+}
+
+bool Translator::sizePendingImage(const GfxRef &ref)
+{
+    /* A load command reached us with no G_SETTIMG in front of it, or with one
+     * whose address never resolved. fast3d would read from a stale image
+     * pointer here; there is nothing sensible to marshal, so leave the
+     * placeholder and let the unsizedImages count show it. */
+    if (!pendingImage_.valid || !ref.addr) {
+        return true;
+    }
+
+    const size_t needed = (size_t)ref.startOffset + ref.bytes;
+    if (needed <= pendingImage_.marshalledLen) {
+        /* An earlier load already covered this extent. The block base has not
+         * moved, so the address already patched in is still right. */
+        return true;
+    }
+
+    RdramAddr addr = 0;
+    if (!pushBlock(ref, Swizzle::BE32, true, &addr)) {
+        return false;
+    }
+
+    pendingImage_.marshalledLen = needed;
+    out_[pendingImage_.pairIndex + 1] = addr;
+
+    /* Re-check the patched command: the address went in behind the validator's
+     * back, and an unchecked address in the stream is exactly what invariant 4
+     * exists to prevent. */
+    if (validate_ && !addressIsWellFormed(addr, arena_.rdramSize())) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "G_SETTIMG patched with 0x%08x, which is not a tagged aligned "
+                 "arena address",
+                 addr);
+        error_ = buf;
+        return false;
+    }
     return true;
 }
 
@@ -219,11 +333,45 @@ Disposition dispositionOf(uint8_t opcode)
     case (uint8_t)G_SETOTHERMODE_H:
     case (uint8_t)G_NOOP:
     case G_EXTRAGEOMETRYMODE_EXT:
+    /* T6, the RDP and texture path. Field layouts were checked one by one
+     * against GBI_RDP's decoders (rt64_gbi_rdp.cpp:17-241) and match fast3d's
+     * exactly, so these pass through with only the opcode and any address
+     * rewritten. G_LOADTLUT is the one that looks like it differs - fast3d
+     * reads 10-bit coordinates at bits 14 and 2 (gfx_pc.cpp:2407) where RT64
+     * reads 12 bits at 12 and 0 (rt64_gbi_rdp.cpp:87-92) - but those are the
+     * same field with and without its two fractional bits, so handing over the
+     * raw words serves both. */
+    case (uint8_t)G_SETTIMG:
+    case (uint8_t)G_SETCIMG:
+    case (uint8_t)G_SETZIMG:
+    case (uint8_t)G_SETTILE:
+    case (uint8_t)G_SETTILESIZE:
+    case (uint8_t)G_LOADBLOCK:
+    case (uint8_t)G_LOADTILE:
+    case (uint8_t)G_LOADTLUT:
+    case (uint8_t)G_SETCOMBINE:
+    case (uint8_t)G_SETENVCOLOR:
+    case (uint8_t)G_SETPRIMCOLOR:
+    case (uint8_t)G_SETFOGCOLOR:
+    case (uint8_t)G_SETFILLCOLOR:
+    case (uint8_t)G_SETSCISSOR:
+    case (uint8_t)G_RDPSETOTHERMODE:
+    case (uint8_t)G_FILLRECT:
+    case (uint8_t)G_TEXRECT:
+    case (uint8_t)G_TEXRECTFLIP:
+    case (uint8_t)G_RDPLOADSYNC:
+    case (uint8_t)G_RDPPIPESYNC:
+    case (uint8_t)G_RDPTILESYNC:
+    case (uint8_t)G_RDPFULLSYNC:
+    /* Not the EXT lowering (that is T7), only the cache invalidation half,
+     * which has to land with the caching it makes sound rather than a task
+     * later. The lowering is "emit nothing, forward to the arena" either way,
+     * so nothing of T7's design is being pre-empted. */
+    case G_INVALTEXCACHE_EXT:
         return Disposition::Translated;
 
     case G_SETFB_EXT:
     case G_SETTIMG_FB_EXT:
-    case G_INVALTEXCACHE_EXT:
     case G_TEXRECT_WIDE_EXT:
     case G_FILLRECT_WIDE_EXT:
     case G_SETGRAYSCALE_EXT:
@@ -239,9 +387,12 @@ Disposition dispositionOf(uint8_t opcode)
         break;
     }
 
-    /* The rest of the port dialect is RDP state and rectangles. gfxOpcodeName
-     * knows the full set, so an opcode it cannot name is not in the dialect at
-     * all and the caller reports UnknownOpcode. */
+    /* What is left is G_RDPHALF_1/2/CONT. On N64 the sky path issues low-level
+     * ucode triangles through them; the port renders sky differently and
+     * fast3d ignores them (gfx_pc.cpp:2537-2542). Forwarding them would be
+     * worse than dropping: RT64's rdpHalf1/rdpHalf2 store them as state that a
+     * following command can consume, so emitting words the reference renderer
+     * ignores could change what gets drawn. */
     return Disposition::DeferredRdp;
 }
 
@@ -324,7 +475,7 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
 
         case G_MTX: {
             RdramAddr addr = 0;
-            if (!pushBlock(ref, Swizzle::U32, &addr)) {
+            if (!pushBlock(ref, Swizzle::U32, false, &addr)) {
                 return TranslateStatus::CaptureMiss;
             }
             const uint32_t params = fieldOf(g[0], 16, 8);
@@ -344,7 +495,7 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             const uint32_t index = fieldOf(g[0], 16, 8);
             const Swizzle type = (index == G_MV_VIEWPORT) ? Swizzle::U16 : Swizzle::U8;
             RdramAddr addr = 0;
-            if (!pushBlock(ref, type, &addr)) {
+            if (!pushBlock(ref, type, false, &addr)) {
                 return TranslateStatus::CaptureMiss;
             }
             emit(((uint32_t)kCanonMoveMem << 24) | (index << 16), addr);
@@ -371,7 +522,7 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
                 return TranslateStatus::UnknownOpcode;
             }
             RdramAddr addr = 0;
-            if (!pushBlock(ref, Swizzle::VtxPD, &addr)) {
+            if (!pushBlock(ref, Swizzle::VtxPD, false, &addr)) {
                 return TranslateStatus::CaptureMiss;
             }
             emit(((uint32_t)kCanonVtx << 24) | ((count - 1) << 20) | (dstIndex << 16),
@@ -390,7 +541,7 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
              * vertex indexes the table by byte offset through its ci field
              * (rt64_rsp.cpp:390), so the whole table must be one block. */
             RdramAddr addr = 0;
-            if (!pushBlock(ref, Swizzle::U8, &addr)) {
+            if (!pushBlock(ref, Swizzle::U8, false, &addr)) {
                 return TranslateStatus::CaptureMiss;
             }
             emit((uint32_t)kCanonVtxColorPD << 24, addr);
@@ -559,6 +710,151 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             break;
         }
 
+        /*
+         * === T6: the RDP and texture path ===
+         *
+         * These share their opcode numbers AND their field layouts with RT64
+         * (checked against rt64_gbi_rdp.cpp:17-241), so the words pass through
+         * unchanged. Only the three that carry an address are rewritten.
+         */
+        case (uint8_t)G_SETTILE:
+        case (uint8_t)G_SETTILESIZE:
+        case (uint8_t)G_LOADBLOCK:
+        case (uint8_t)G_LOADTILE:
+        case (uint8_t)G_LOADTLUT:
+        case (uint8_t)G_SETCOMBINE:
+        case (uint8_t)G_SETENVCOLOR:
+        case (uint8_t)G_SETPRIMCOLOR:
+        case (uint8_t)G_SETFOGCOLOR:
+        case (uint8_t)G_SETFILLCOLOR:
+        case (uint8_t)G_SETSCISSOR:
+        case (uint8_t)G_RDPSETOTHERMODE:
+        case (uint8_t)G_FILLRECT:
+        case (uint8_t)G_RDPLOADSYNC:
+        case (uint8_t)G_RDPPIPESYNC:
+        case (uint8_t)G_RDPTILESYNC:
+        case (uint8_t)G_RDPFULLSYNC: {
+            /* A load command is where a pending G_SETTIMG finally learns its
+             * size. gfxStep has already computed the extent fast3d would read;
+             * marshal it and patch the address back into the emitted command. */
+            if (ref.kind == RefKind::Texels || ref.kind == RefKind::Tlut) {
+                if (!sizePendingImage(ref)) {
+                    return TranslateStatus::CaptureMiss;
+                }
+            }
+            const uint32_t w0 = (uint32_t)g[0].words.w0;
+            const uint32_t w1 = (uint32_t)g[0].words.w1;
+            emit(w0, w1);
+            expect.opcode = opcode;
+            expect.fields[0] = w0 & 0x00ffffff;
+            expect.fields[1] = w1;
+            expect.fieldCount = 2;
+            emitted = true;
+            break;
+        }
+
+        case (uint8_t)G_SETTIMG: {
+            /* Emitted now with a placeholder address, patched when a load
+             * command gives the image a size. See PendingImage. */
+            /* The one being replaced was never sized if no load command ever
+             * grew it. Testing `valid` alone would count every image after the
+             * first, since a sized one stays pending until the next G_SETTIMG
+             * displaces it. */
+            if (pendingImage_.valid && pendingImage_.marshalledLen == 0) {
+                ++stats_.unsizedImages;
+            }
+            const uint32_t w0 = (uint32_t)g[0].words.w0;
+            pendingImage_ = PendingImage{};
+            pendingImage_.pairIndex = out_.size();
+            pendingImage_.valid = true;
+            pendingImage_.src = st_.texAddr;
+            emit(w0, 0);
+            expect.opcode = opcode;
+            expect.fields[0] = w0 & 0x00ffffff;
+            expect.fields[1] = 0;
+            expect.fieldCount = 2;
+            emitted = true;
+            break;
+        }
+
+        case (uint8_t)G_SETCIMG:
+        case (uint8_t)G_SETZIMG: {
+            /* The game names its own framebuffers; we render into synthetic
+             * RDRAM, so these are redirected to the arena's images rather than
+             * marshalled. Which of the two main colour images is current is the
+             * register block's business and is not modelled until T8, so the
+             * first is used unconditionally - correct for a single-buffered
+             * frame and the thing T8 has to replace. */
+            const uint32_t w0 = (uint32_t)g[0].words.w0;
+            const RdramAddr img = (opcode == (uint8_t)G_SETZIMG)
+                                      ? fbs_.depthImage()
+                                      : fbs_.mainColorImage(0);
+            emit(w0, img);
+            expect.opcode = opcode;
+            expect.fields[0] = w0 & 0x00ffffff;
+            expect.fields[1] = img;
+            expect.fieldCount = 2;
+            emitted = true;
+            break;
+        }
+
+        case (uint8_t)G_TEXRECT:
+        case (uint8_t)G_TEXRECTFLIP: {
+            /* Three commands on both sides, and the same field positions - the
+             * port just spreads them over three 16-byte Gfx where RT64 reads
+             * three 8-byte ones, consuming the trailing two itself
+             * (rt64_gbi_rdp.cpp:171-186) rather than dispatching them.
+             *
+             * Their w0 is therefore never read. It is filled with the N64
+             * convention's G_RDPHALF_1 and G_RDPHALF_2 so a disassembly of the
+             * stream is legible; a bare zero would decode as G_SPNOOP and read
+             * like a stray extended-GBI hook. */
+            emit((uint32_t)g[0].words.w0, (uint32_t)g[0].words.w1);
+            expect.opcode = opcode;
+            expect.fields[0] = (uint32_t)g[0].words.w0 & 0x00ffffff;
+            expect.fields[1] = (uint32_t)g[0].words.w1;
+            expect.fieldCount = 2;
+
+            if (validate_ && !validateEmitted(pairIndex, expect)) {
+                return TranslateStatus::ValidationFailed;
+            }
+
+            const uint8_t halfOpcodes[2] = {kCanonRdpHalf1, kCanonRdpHalf2};
+            const uint32_t halfWords[2] = {(uint32_t)g[1].words.w1,
+                                           (uint32_t)g[2].words.w1};
+            for (int h = 0; h < 2; ++h) {
+                const size_t halfIndex = out_.size();
+                emit((uint32_t)halfOpcodes[h] << 24, halfWords[h]);
+                if (validate_) {
+                    DecodedCmd halfExpect;
+                    halfExpect.opcode = halfOpcodes[h];
+                    halfExpect.fields[0] = halfWords[h];
+                    halfExpect.fieldCount = 1;
+                    if (!validateEmitted(halfIndex, halfExpect)) {
+                        return TranslateStatus::ValidationFailed;
+                    }
+                }
+            }
+
+            at += sizeof(Gfx) * words;
+            continue;
+        }
+
+        case G_INVALTEXCACHE_EXT: {
+            /* Emits nothing: this is the game telling the renderer that texture
+             * data at an address has changed, which is what makes caching those
+             * blocks sound. fast3d does the same thing to its own cache
+             * (gfx_pc.cpp:2530-2535). A null argument clears everything. */
+            const uintptr_t tex = gfxSegResolve((uintptr_t)g[0].words.w1, st_.segments);
+            if (tex) {
+                arena_.invalidateCache(tex);
+            } else {
+                arena_.clearCache();
+            }
+            at += sizeof(Gfx) * words;
+            continue;
+        }
+
         case (uint8_t)G_ENDDL:
             /* The flattened stream gets exactly one G_ENDDL, appended by
              * translate() once the whole walk is done. */
@@ -600,7 +896,8 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             const uint32_t w1 = out_[pairIndex + 1];
             const bool carriesAddress =
                 expect.opcode == kCanonMtx || expect.opcode == kCanonMoveMem ||
-                expect.opcode == kCanonVtx || expect.opcode == kCanonVtxColorPD;
+                expect.opcode == kCanonVtx || expect.opcode == kCanonVtxColorPD ||
+                expect.opcode == (uint8_t)G_SETCIMG || expect.opcode == (uint8_t)G_SETZIMG;
             if (carriesAddress && !addressIsWellFormed(w1, arena_.rdramSize())) {
                 char buf[128];
                 snprintf(buf, sizeof(buf),
@@ -628,6 +925,12 @@ TranslateStatus Translator::translate(uintptr_t rootDl, RdramAddr *outStart,
     const TranslateStatus status = walk(rootDl, 0);
     if (status != TranslateStatus::Ok) {
         return status;
+    }
+
+    /* The last image in the stream has no following G_SETTIMG to displace it,
+     * so it is checked here rather than being missed. */
+    if (pendingImage_.valid && pendingImage_.marshalledLen == 0) {
+        ++stats_.unsizedImages;
     }
 
     /* One terminator for the whole flattened stream. */
