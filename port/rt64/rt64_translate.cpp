@@ -27,6 +27,9 @@ namespace {
 constexpr uint32_t kRt64HookMagic = 0x525464;      // rt64_extended_gbi.h:23
 constexpr uint32_t kRt64HookOpEnable = 0x1;        // rt64_extended_gbi.h:17
 constexpr uint32_t kGexSetRdramExtendedV1 = 0x2C;  // rt64_extended_gbi.h:75
+constexpr uint32_t kGexTexRectV1 = 0x02;           // rt64_extended_gbi.h:33
+constexpr uint32_t kGexFillRectV1 = 0x03;          // rt64_extended_gbi.h:34
+constexpr uint32_t kGexOriginNone = 0x800;         // rt64_extended_gbi.h:84
 
 /* Canonical opcodes, from RT64's F3D/F3DPD maps. Named here rather than
  * included so the numbers sit next to the lowering that uses them. */
@@ -64,6 +67,17 @@ constexpr uint32_t kMaxCommands = 200000;
 inline uint32_t fieldOf(const Gfx &g, uint32_t pos, uint32_t width)
 {
     return (uint32_t)((g.words.w0 >> pos) & ((1ULL << width) - 1));
+}
+
+/* fast3d's C0/C1 (gfx_pc.cpp:91-92), for the multi-word EXT rectangles. */
+inline uint32_t c0(const Gfx &g, uint32_t pos, uint32_t width)
+{
+    return (uint32_t)((g.words.w0 >> pos) & ((1ULL << width) - 1));
+}
+
+inline uint32_t c1(const Gfx &g, uint32_t pos, uint32_t width)
+{
+    return (uint32_t)((g.words.w1 >> pos) & ((1ULL << width) - 1));
 }
 
 /*
@@ -142,6 +156,18 @@ void Translator::beginFrame()
     st_.reset();
     invertCulling_ = false;
     pendingImage_ = PendingImage{};
+    /* Until the game binds its own, the main image is the arena's, at the size
+     * it was allocated. A depth clear can arrive before the frame's first
+     * G_SETCIMG - it does in the menu capture - and restoring to a command
+     * with no width would hand RT64 an image one pixel across. */
+    uint32_t nativeW = 0, nativeH = 0;
+    fbs_.fbSize(0, &nativeW, &nativeH);
+    mainCimgW0_ = ((uint32_t)(uint8_t)G_SETCIMG << 24) | (2u << 19) |
+                  ((nativeW ? nativeW - 1 : 0) & 0xfff);
+    mainCimg_ = fbs_.mainColorImage(0);
+    boundCimgW0_ = mainCimgW0_;
+    boundCimg_ = mainCimg_;
+    otherModeH_ = 0;
     stats_ = TranslateStats{};
     error_.clear();
 }
@@ -217,6 +243,155 @@ bool Translator::pushBlock(const GfxRef &ref, Swizzle type, bool cached, RdramAd
     *out = arena_.pushFrameData(mem_, ref.addr, len, type);
     stats_.marshalledBytes += len;
     return true;
+}
+
+/*
+ * === EXT lowerings that expand to more than one command (SCAFFOLD 3.4) ===
+ *
+ * These are emitted straight rather than through the validator's expect/got
+ * path: they are sequences this file composes rather than translations of one
+ * source command, so there is no source command to check them against. Every
+ * address they emit comes from FbRegistry, which only ever hands out arena
+ * allocations, so invariant 4 holds by construction.
+ */
+
+void Translator::emitSetColorImage(uint32_t w0, RdramAddr addr)
+{
+    emit(w0, addr);
+    boundCimgW0_ = w0;
+    boundCimg_ = addr;
+}
+
+void Translator::emitDepthClear()
+{
+    /* The canonical N64 depth clear, which RT64 recognises: point the colour
+     * image at the depth buffer, fill it with the maximum depth value, and put
+     * the colour image back. fast3d instead calls clear_framebuffer directly
+     * (gfx_pc.cpp:2545-2548), which has no equivalent in a command stream.
+     *
+     * Fill cycle is not optional - a G_FILLRECT outside it does not write the
+     * packed value - so the cycle type is switched and restored around it. */
+    const uint32_t savedW0 = boundCimgW0_;
+    const RdramAddr savedAddr = boundCimg_;
+
+    uint32_t w = 0, h = 0;
+    fbs_.fbSize(0, &w, &h);
+
+    /* Cycle type to fill. G_MDSFT_CYCLETYPE is 20 and the field is 2 bits
+     * (gbi.h:502,514); RT64 masks with the same shift and width
+     * (rt64_rsp.cpp:1033-1038). */
+    emit(((uint32_t)kCanonSetOtherModeH << 24) | (20u << 8) | 2u, (uint32_t)G_CYC_FILL);
+
+    /* RGBA16 depth image at the arena's depth allocation. */
+    emitSetColorImage(((uint32_t)(uint8_t)G_SETCIMG << 24) | (2u << 19) |
+                          ((w ? w - 1 : 0) & 0xfff),
+                      fbs_.depthImage());
+
+    /* Two 16-bit maximum-depth values packed into the fill word. */
+    emit(((uint32_t)(uint8_t)G_SETFILLCOLOR << 24), 0xFFFCFFFCu);
+
+    /* Full frame, in the 2.2 fixed point the RDP rectangles use. */
+    const uint32_t lrx = w ? (w - 1) << 2 : 0;
+    const uint32_t lry = h ? (h - 1) << 2 : 0;
+    emit(((uint32_t)(uint8_t)G_FILLRECT << 24) | (lrx << 12) | lry, 0);
+
+    /* Put back what was there. */
+    emitSetColorImage(savedW0, savedAddr);
+    emit(((uint32_t)kCanonSetOtherModeH << 24) | (20u << 8) | 2u,
+         otherModeH_ & (3u << 20));
+}
+
+void Translator::emitFramebufferCopy(const Gfx &cmd)
+{
+    /* f3d_copy_framebuffer(dst, src, x, y, flip) (gfx_pc.cpp:2524). Lowered to
+     * the sequence that copies one image into another through the texture
+     * unit: bind the destination, bind the source as a texture, describe it as
+     * a tile, and draw a rectangle over it. */
+    const uint32_t dst = (uint32_t)((cmd.words.w0 >> 11) & 0x7ff);
+    const uint32_t src = (uint32_t)(cmd.words.w0 & 0x7ff);
+    const int16_t x = (int16_t)((cmd.words.w1 >> 16) & 0xffff);
+    const int16_t y = (int16_t)(cmd.words.w1 & 0xffff);
+    const uint32_t flip = (uint32_t)((cmd.words.w0 >> 22) & 1);
+
+    const uint32_t savedW0 = boundCimgW0_;
+    const RdramAddr savedAddr = boundCimg_;
+
+    uint32_t sw = 0, sh = 0;
+    fbs_.fbSize((int)src, &sw, &sh);
+    uint32_t dw = 0, dh = 0;
+    fbs_.fbSize((int)dst, &dw, &dh);
+
+    emitSetColorImage(((uint32_t)(uint8_t)G_SETCIMG << 24) | (2u << 19) |
+                          ((dw ? dw - 1 : 0) & 0xfff),
+                      fbs_.fbAddress((int)dst));
+
+    emit(((uint32_t)(uint8_t)G_SETTIMG << 24) | (2u << 19) |
+             ((sw ? sw - 1 : 0) & 0xfff),
+         fbs_.fbAddress((int)src));
+
+    /* Tile 0, RGBA16. `line` counts 64-bit words per row, which for 16-bit
+     * texels is width/4. */
+    emit(((uint32_t)(uint8_t)G_SETTILE << 24) | (2u << 19) | (((sw >> 2) & 0x1ff) << 9), 0);
+    emit(((uint32_t)(uint8_t)G_SETTILESIZE << 24),
+         ((sw ? (sw - 1) << 2 : 0) << 12) | (sh ? (sh - 1) << 2 : 0));
+
+    /* One rectangle over the destination region, sampled 1:1 - dsdx and dtdy
+     * are 1.0 in the 5.10 fixed point the RDP uses for them. */
+    const uint32_t ulx = (uint32_t)((x < 0 ? 0 : x) << 2) & 0xfff;
+    const uint32_t uly = (uint32_t)((y < 0 ? 0 : y) << 2) & 0xfff;
+    const uint32_t lrx = (ulx + (sw ? (sw - 1) << 2 : 0)) & 0xfff;
+    const uint32_t lry = (uly + (sh ? (sh - 1) << 2 : 0)) & 0xfff;
+    const uint8_t rectOp = flip ? (uint8_t)G_TEXRECTFLIP : (uint8_t)G_TEXRECT;
+    emit(((uint32_t)rectOp << 24) | (lrx << 12) | lry, (ulx << 12) | uly);
+    emit((uint32_t)kCanonRdpHalf1 << 24, 0);
+    emit((uint32_t)kCanonRdpHalf2 << 24, (0x0400u << 16) | 0x0400u);
+
+    emitSetColorImage(savedW0, savedAddr);
+}
+
+void Translator::emitImageRect(const Gfx *cmd)
+{
+    /* gfx_dp_image_rectangle(tile, iw, ih, x0,y0,s0,t0, x1,y1,s1,t1)
+     * (gfx_pc.cpp:2483-2501): a textured quad given by two corners with their
+     * texture coordinates. Lowered to a tile description plus one rectangle;
+     * the rate of change is derived from the two corners rather than assumed,
+     * because an image rectangle is how the menus scale artwork. */
+    const uint32_t tile = (uint32_t)(cmd[0].words.w0 & 0x7);
+    const uint32_t iw = (uint32_t)((cmd[0].words.w1 >> 16) & 0xffff);
+    const uint32_t ih = (uint32_t)(cmd[0].words.w1 & 0xffff);
+    const int16_t x0 = (int16_t)((cmd[1].words.w0 >> 16) & 0xffff);
+    const int16_t y0 = (int16_t)(cmd[1].words.w0 & 0xffff);
+    const int16_t s0 = (int16_t)((cmd[1].words.w1 >> 16) & 0xffff);
+    const int16_t t0 = (int16_t)(cmd[1].words.w1 & 0xffff);
+    const int16_t x1 = (int16_t)((cmd[2].words.w0 >> 16) & 0xffff);
+    const int16_t y1 = (int16_t)(cmd[2].words.w0 & 0xffff);
+    const int16_t s1 = (int16_t)((cmd[2].words.w1 >> 16) & 0xffff);
+    const int16_t t1 = (int16_t)(cmd[2].words.w1 & 0xffff);
+
+    emit(((uint32_t)(uint8_t)G_SETTILESIZE << 24),
+         ((uint32_t)tile << 24) | ((iw ? (iw - 1) << 2 : 0) << 12) |
+             (ih ? (ih - 1) << 2 : 0));
+
+    /* dsdx and dtdy are texels per pixel in 5.10 fixed point. A zero-width
+     * rectangle would divide by zero, so it is emitted at 1:1 and left for the
+     * rasteriser to reject. */
+    const int32_t dx = (int32_t)x1 - (int32_t)x0;
+    const int32_t dy = (int32_t)y1 - (int32_t)y0;
+    const uint32_t dsdx =
+        dx ? (uint32_t)((((int32_t)s1 - (int32_t)s0) << 10) / dx) & 0xffff : 0x0400u;
+    const uint32_t dtdy =
+        dy ? (uint32_t)((((int32_t)t1 - (int32_t)t0) << 10) / dy) & 0xffff : 0x0400u;
+
+    const uint32_t ulx = ((uint32_t)(x0 < 0 ? 0 : x0) << 2) & 0xfff;
+    const uint32_t uly = ((uint32_t)(y0 < 0 ? 0 : y0) << 2) & 0xfff;
+    const uint32_t lrx = ((uint32_t)(x1 < 0 ? 0 : x1) << 2) & 0xfff;
+    const uint32_t lry = ((uint32_t)(y1 < 0 ? 0 : y1) << 2) & 0xfff;
+
+    emit(((uint32_t)(uint8_t)G_TEXRECT << 24) | (lrx << 12) | lry,
+         (tile << 24) | (ulx << 12) | uly);
+    emit((uint32_t)kCanonRdpHalf1 << 24,
+         ((uint32_t)(uint16_t)s0 << 16) | (uint32_t)(uint16_t)t0);
+    emit((uint32_t)kCanonRdpHalf2 << 24, (dsdx << 16) | dtdy);
 }
 
 bool Translator::sizePendingImage(const GfxRef &ref)
@@ -368,8 +543,9 @@ Disposition dispositionOf(uint8_t opcode)
      * later. The lowering is "emit nothing, forward to the arena" either way,
      * so nothing of T7's design is being pre-empted. */
     case G_INVALTEXCACHE_EXT:
-        return Disposition::Translated;
-
+    /* T7, the EXT dialect. Every one of these is now handled - lowered,
+     * expanded, or deliberately dropped with a counter - so none reaches the
+     * unknown path. */
     case G_SETFB_EXT:
     case G_SETTIMG_FB_EXT:
     case G_TEXRECT_WIDE_EXT:
@@ -381,7 +557,7 @@ Disposition dispositionOf(uint8_t opcode)
     case G_RDPFLUSH_EXT:
     case G_CLEAR_DEPTH_EXT:
     case G_SETSUBPIXELOFFSET_EXT:
-        return Disposition::DeferredExt;
+        return Disposition::Translated;
 
     default:
         break;
@@ -700,6 +876,12 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             const uint8_t canon = (opcode == (uint8_t)G_SETOTHERMODE_L)
                                       ? kCanonSetOtherModeL
                                       : kCanonSetOtherModeH;
+            if (canon == kCanonSetOtherModeH) {
+                /* Shadow it the way RT64 will apply it (rt64_rsp.cpp:1033), so
+                 * the depth clear has something to restore. */
+                const uint32_t mask = (uint32_t)(((1ULL << bits) - 1) << shift);
+                otherModeH_ = (otherModeH_ & ~mask) | (value & mask);
+            }
             emit(((uint32_t)canon << 24) | (shift << 8) | bits, value);
             expect.opcode = canon;
             expect.fields[0] = bits;
@@ -744,6 +926,9 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             }
             const uint32_t w0 = (uint32_t)g[0].words.w0;
             const uint32_t w1 = (uint32_t)g[0].words.w1;
+            if (opcode == (uint8_t)G_RDPSETOTHERMODE) {
+                otherModeH_ = w0 & 0x00ffffff;
+            }
             emit(w0, w1);
             expect.opcode = opcode;
             expect.fields[0] = w0 & 0x00ffffff;
@@ -789,6 +974,12 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             const RdramAddr img = (opcode == (uint8_t)G_SETZIMG)
                                       ? fbs_.depthImage()
                                       : fbs_.mainColorImage(0);
+            if (opcode == (uint8_t)G_SETCIMG) {
+                mainCimgW0_ = w0;
+                mainCimg_ = img;
+                boundCimgW0_ = w0;
+                boundCimg_ = img;
+            }
             emit(w0, img);
             expect.opcode = opcode;
             expect.fields[0] = w0 & 0x00ffffff;
@@ -839,6 +1030,128 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             at += sizeof(Gfx) * words;
             continue;
         }
+
+        /*
+         * === T7: the EXT dialect (SCAFFOLD 3.4) ===
+         */
+
+        case G_SETFB_EXT: {
+            /* Bind one of the game's offscreen framebuffers as the colour
+             * image. Handle 0 means "back to the main image", which is why the
+             * current one is tracked rather than assumed
+             * (gfx_pc.cpp:2513-2522). */
+            const uint32_t fb = (uint32_t)g[0].words.w1;
+            if (fb == 0) {
+                emitSetColorImage(mainCimgW0_, mainCimg_);
+            } else {
+                uint32_t fw = 0, fh = 0;
+                fbs_.fbSize((int)fb, &fw, &fh);
+                emitSetColorImage(((uint32_t)(uint8_t)G_SETCIMG << 24) | (2u << 19) |
+                                      ((fw ? fw - 1 : 0) & 0xfff),
+                                  fbs_.fbAddress((int)fb));
+            }
+            at += sizeof(Gfx) * words;
+            continue;
+        }
+
+        case G_SETTIMG_FB_EXT: {
+            /* Bind a framebuffer as the texture source. No marshalling: the
+             * image lives in the arena already and RT64's framebuffer manager
+             * detects the overlap and copies on the GPU. Any pending image is
+             * dropped, so a later load cannot patch an address into a command
+             * that no longer points at marshalled memory. */
+            const uint32_t fb = (uint32_t)g[0].words.w1;
+            uint32_t fw = 0, fh = 0;
+            fbs_.fbSize((int)fb, &fw, &fh);
+            emit(((uint32_t)(uint8_t)G_SETTIMG << 24) | (2u << 19) |
+                     ((fw ? fw - 1 : 0) & 0xfff),
+                 fbs_.fbAddress((int)fb));
+            pendingImage_ = PendingImage{};
+            at += sizeof(Gfx) * words;
+            continue;
+        }
+
+        case G_COPYFB_EXT:
+            emitFramebufferCopy(g[0]);
+            at += sizeof(Gfx) * words;
+            continue;
+
+        case G_CLEAR_DEPTH_EXT:
+            emitDepthClear();
+            at += sizeof(Gfx) * words;
+            continue;
+
+        case G_IMAGERECT_EXT:
+            emitImageRect(&g[0]);
+            at += sizeof(Gfx) * words;
+            continue;
+
+        case G_FILLRECT_WIDE_EXT: {
+            /* G_EX_FILLRECT_V1: two commands, the first carrying the alignment
+             * origins and the second the corners as int16
+             * (rt64_gbi_extended.cpp:43-54). The port's coordinates are
+             * sign-extended 24-bit in the same 2.2 fixed point
+             * (gfx_pc.cpp:2455-2462); at the widest supported resolution they
+             * are far inside int16, so the narrowing is safe.
+             *
+             * Both origins are G_EX_ORIGIN_NONE, which is RT64's own default
+             * (rt64_rdp.h:49) and means no alignment adjustment - matching the
+             * decision to drop the aspect flags in v1. */
+            const int32_t lrx = (int32_t)(c0(g[0], 0, 24) << 8) >> 8;
+            const int32_t lry = (int32_t)(c1(g[0], 0, 24) << 8) >> 8;
+            const int32_t ulx = (int32_t)(c0(g[1], 0, 24) << 8) >> 8;
+            const int32_t uly = (int32_t)(c1(g[1], 0, 24) << 8) >> 8;
+            emit(((uint32_t)kExtendedOpcode << 24) | kGexFillRectV1,
+                 (uint32_t)kGexOriginNone | ((uint32_t)kGexOriginNone << 12));
+            emit(((uint32_t)(uint16_t)ulx << 16) | (uint32_t)(uint16_t)uly,
+                 ((uint32_t)(uint16_t)lrx << 16) | (uint32_t)(uint16_t)lry);
+            at += sizeof(Gfx) * words;
+            continue;
+        }
+
+        case G_TEXRECT_WIDE_EXT: {
+            /* G_EX_TEXRECT_V1: three commands (rt64_gbi_extended.cpp:22-41).
+             * Nothing in this build emits the source opcode - the macros exist
+             * but have no callers - so this lowering is exercised only by its
+             * unit test and has never met real data. */
+            const int32_t lrx = (int32_t)(c0(g[0], 0, 24) << 8) >> 8;
+            const int32_t lry = (int32_t)(c1(g[0], 0, 24) << 8) >> 8;
+            const uint32_t tile = c1(g[0], 24, 3);
+            const uint32_t flip = c1(g[0], 27, 1);
+            const int32_t ulx = (int32_t)(c0(g[1], 0, 24) << 8) >> 8;
+            const int32_t uly = (int32_t)(c1(g[1], 0, 24) << 8) >> 8;
+            const uint32_t uls = c0(g[2], 16, 16), ult = c0(g[2], 0, 16);
+            const uint32_t dsdx = c1(g[2], 16, 16), dtdy = c1(g[2], 0, 16);
+
+            emit(((uint32_t)kExtendedOpcode << 24) | kGexTexRectV1,
+                 tile | (flip << 7) | ((uint32_t)kGexOriginNone << 3) |
+                     ((uint32_t)kGexOriginNone << 15));
+            emit(((uint32_t)(uint16_t)ulx << 16) | (uint32_t)(uint16_t)uly,
+                 ((uint32_t)(uint16_t)lrx << 16) | (uint32_t)(uint16_t)lry);
+            emit((uls << 16) | ult, (dsdx << 16) | dtdy);
+            at += sizeof(Gfx) * words;
+            continue;
+        }
+
+        case G_RDPFLUSH_EXT:
+            /* A batching artefact of fast3d (gfx_pc.cpp:2544), with nothing to
+             * express in a command stream. Not counted as dropped: no output
+             * is the correct translation, not a gap. */
+            at += sizeof(Gfx) * words;
+            continue;
+
+        case G_SETGRAYSCALE_EXT:
+        case G_SETINTENSITY_EXT:
+        case G_SETSUBPIXELOFFSET_EXT:
+            /* Dropped and counted in v1 (SCAFFOLD 3.4). Grayscale and intensity
+             * drive the IR scanner and cloak, which degrade visually rather
+             * than break, and the effects phase decides their real mapping;
+             * RT64 renders subpixel-correct at high resolution, so the offset
+             * has nothing to apply to. */
+            ++stats_.droppedCommands;
+            ++stats_.droppedPerOpcode[opcode];
+            at += sizeof(Gfx) * words;
+            continue;
 
         case G_INVALTEXCACHE_EXT: {
             /* Emits nothing: this is the game telling the renderer that texture

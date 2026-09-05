@@ -202,6 +202,14 @@ private:
      * G_SETTIMG that named it. Returns false only on a capture miss. */
     bool sizePendingImage(const GfxRef &ref);
 
+    /* EXT lowerings that expand to several canonical commands (SCAFFOLD 3.4).
+     * Each leaves the RDP state it found: whatever colour image or cycle type
+     * they change, they change back. */
+    void emitSetColorImage(uint32_t w0, RdramAddr addr);
+    void emitDepthClear();
+    void emitFramebufferCopy(const Gfx &cmd);
+    void emitImageRect(const Gfx *cmd);
+
     TranslateStatus walk(uintptr_t at, int depth);
     bool validateEmitted(size_t pairIndex, const DecodedCmd &expect);
 
@@ -232,6 +240,26 @@ private:
         size_t marshalledLen = 0;
     };
     PendingImage pendingImage_;
+
+    /* Two different colour images, and conflating them is a bug the tests
+     * caught: `bound` is whatever the stream last pointed at, which the
+     * multi-command lowerings save and restore around their own work, while
+     * `main` is the last one the GAME chose with a G_SETCIMG, which is what
+     * G_SETFB_EXT(0) means by "back to the main image". Binding an offscreen
+     * framebuffer must not overwrite the second, or the restore returns to the
+     * framebuffer it was meant to leave.
+     *
+     * Both keep the whole emitted command, because restoring an address
+     * without the format and width the game chose rebinds the image wrongly. */
+    uint32_t boundCimgW0_ = 0;
+    RdramAddr boundCimg_ = 0;
+    uint32_t mainCimgW0_ = 0;
+    RdramAddr mainCimg_ = 0;
+
+    /* Shadow of the high othermode word, tracked from the commands that set
+     * it. The depth-clear idiom has to switch to fill cycle and switch back,
+     * and there is nothing to switch back to unless we know what it was. */
+    uint32_t otherModeH_ = 0;
 
     GfxWalkState st_;
     std::vector<uint32_t> out_;   // emitted words, flushed to the arena at end
