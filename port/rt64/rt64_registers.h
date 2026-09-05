@@ -18,10 +18,20 @@
  * the image address directly makes RT64 read one row above it. So the row is
  * added here, and regsScanoutAddress reports what RT64 will actually compute.
  *
- * The origin is a tagged extended-RDRAM address, like every other address the
- * translator emits. RT64 matches it against the framebuffers the stream
- * created with G_SETCIMG (rt64_present_queue.cpp:146), and those carry the
- * tag, so the VI has to as well or the lookup finds nothing.
+ * The origin is NOT a tagged extended-RDRAM address, even though every address
+ * the translator emits is. Two maskings decide it and they agree:
+ * Application::Core::decodeVI masks this register to 24 bits
+ * (rt64_application.cpp:48), which strips the tag whatever we do, and
+ * RDP::maskAddress subtracts the tag when a colour image is registered
+ * (rt64_rdp.cpp:241-248). So the framebuffers RT64 matches the origin against
+ * (rt64_present_queue.cpp:146) live at raw arena offsets, and the VI must too.
+ * An earlier draft of this header claimed the opposite and was wrong: the tag
+ * never survived decodeVI, so the lookup would have found nothing.
+ *
+ * That 24-bit mask is also a layout constraint. The colour images being
+ * scanned out have to sit below 16 MB in the arena. The framebuffer region is
+ * allocated first (rt64_arena.h) so this holds by construction, but a layout
+ * change that moved it would break presentation silently.
  *
  * The height comes out of a decode that rounds. VI::fbSize derives it from the
  * vertical region and the y scale, adds two rows and rounds to a multiple of
@@ -72,14 +82,14 @@ void regsInit(Registers *regs, uint32_t nativeWidth, uint32_t nativeHeight);
  * pdsched.c:213 switches between lo- and hi-res - so this is not a one-off. */
 void regsSetVideoMode(Registers *regs, uint32_t nativeWidth, uint32_t nativeHeight);
 
-/* Points the VI at `colorImage` for the frame being presented, adding the row
- * RT64 subtracts back. Call once per frame, alternating the main colour images
- * so RT64's present logic sees a buffer flip. */
+/* Points the VI at `colorImage` for the frame being presented: strips the
+ * extended-RDRAM tag and adds back the row RT64 subtracts. Call once per frame,
+ * alternating the main colour images so RT64's present logic sees a flip. */
 void regsSetScanout(Registers *regs, RdramAddr colorImage);
 
-/* The address RT64 will decode out of viOrigin, i.e. what regsSetScanout was
- * given. Exists so a test can state the round trip rather than restate the
- * row arithmetic. */
+/* The arena offset RT64 will decode out of viOrigin - the untagged form of
+ * what regsSetScanout was given. Exists so a test can state the round trip
+ * rather than restate the row arithmetic. */
 RdramAddr regsScanoutAddress(const Registers *regs);
 
 } // namespace pdrt64

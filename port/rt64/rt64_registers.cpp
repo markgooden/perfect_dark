@@ -102,11 +102,15 @@ void regsSetVideoMode(Registers *regs, uint32_t nativeWidth, uint32_t nativeHeig
 
 void regsSetScanout(Registers *regs, RdramAddr colorImage)
 {
-    /* Add back the row RT64 will subtract, so its decode lands on the image
-     * itself. Without this the presented frame is one row above the arena
-     * allocation - inside the previous framebuffer, which renders as a picture
-     * that is subtly wrong rather than obviously broken. */
-    regs->viOrigin = colorImage + rowBytes(regs);
+    /* Strip the tag: decodeVI masks this register to 24 bits
+     * (rt64_application.cpp:48), and colour images register at untagged
+     * offsets (rt64_rdp.cpp:241-248), so both sides of RT64's match are raw
+     * arena offsets.
+     *
+     * Then add back the row RT64 subtracts, so its decode lands on the image
+     * itself rather than one row above it - inside the previous allocation,
+     * which renders as a picture that is subtly wrong rather than broken. */
+    regs->viOrigin = (colorImage & ~kExtendedAddrBit) + rowBytes(regs);
 }
 
 RdramAddr regsScanoutAddress(const Registers *regs)
