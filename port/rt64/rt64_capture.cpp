@@ -116,10 +116,13 @@ struct CaptureState {
     uint32_t texWidth = 0;
 
     /* Census (T3-lite): per-region accounting of what the frame referenced.
-     * "untracked" is anything outside heap, ROM and image - in practice the
-     * malloc'd room graphics blocks (see recordRange). */
-    uint32_t heapBlocks = 0, romBlocks = 0, imageBlocks = 0, untrackedRefs = 0;
-    uint64_t heapBytes = 0, romBytes = 0, imageBytes = 0, untrackedBytes = 0;
+     * "malloc" is the port's tracked allocations (room graphics data);
+     * "untracked" is anything left over, which should be zero and is a gap
+     * in the translator's memory model if it is not. */
+    uint32_t heapBlocks = 0, romBlocks = 0, imageBlocks = 0;
+    uint32_t mallocBlocks = 0, untrackedRefs = 0;
+    uint64_t heapBytes = 0, romBytes = 0, imageBytes = 0;
+    uint64_t mallocBytes = 0, untrackedBytes = 0;
 
     /* Hotkey arming: --capture-key sets these up, F9 fires them. */
     bool hotkeyEnabled = false;
@@ -222,12 +225,23 @@ void recordRange(uintptr_t addr, size_t len)
     } else if (inRegion(addr, len, g_RomFile, g_RomFileSize)) {
         ++g_cap.romBlocks;
         g_cap.romBytes += len;
+    } else if (sysMemIsTracked((const void *)addr, (u32)len)) {
+        /* Room graphics data: bgLoadRoom allocates it with plain sysMemAlloc
+         * on the port (src/game/bg.c:2839), so it is in none of the spans
+         * above and the allocation registry is what identifies it. */
+        ++g_cap.mallocBlocks;
+        g_cap.mallocBytes += len;
     } else {
-        /* Outside every modelled region. Measured, this is room graphics
-         * data: bgLoadRoom allocates it with plain malloc on the port
-         * (src/game/bg.c:2839), so it is neither heap nor romdata. */
+        /* Reached by fast3d, so mapped, but in memory nothing accounts for.
+         * The translator cannot read this - it has no "fast3d is about to
+         * read it" guarantee - so a nonzero count here is a real gap and
+         * wants chasing, not tolerating. */
         ++g_cap.untrackedRefs;
         g_cap.untrackedBytes += len;
+        if (g_cap.untrackedRefs <= 4) {
+            sysLogPrintf(LOG_WARNING, "census: unaccounted ref %p (%u bytes)",
+                         (void *)addr, (unsigned)len);
+        }
     }
 
     auto it = g_cap.ranges.find(addr);
@@ -585,11 +599,12 @@ void flushFrame(void)
                      path, (unsigned)g_cap.roots.size(), rangeCount,
                      (unsigned long long)rangeBytes);
         sysLogPrintf(LOG_NOTE, "census: %u commands | heap %u/%lluB | rom %u/%lluB | image %u/%lluB "
-                     "| room(malloc) %u/%lluB",
+                     "| malloc %u/%lluB | unaccounted %u/%lluB",
                      g_cap.executedCount,
                      g_cap.heapBlocks, (unsigned long long)g_cap.heapBytes,
                      g_cap.romBlocks, (unsigned long long)g_cap.romBytes,
                      g_cap.imageBlocks, (unsigned long long)g_cap.imageBytes,
+                     g_cap.mallocBlocks, (unsigned long long)g_cap.mallocBytes,
                      g_cap.untrackedRefs, (unsigned long long)g_cap.untrackedBytes);
     }
 
@@ -605,8 +620,10 @@ void flushFrame(void)
     g_cap.ranges.clear();
     g_cap.executed.clear();
     g_cap.executedCount = 0;
-    g_cap.heapBlocks = g_cap.romBlocks = g_cap.imageBlocks = g_cap.untrackedRefs = 0;
-    g_cap.heapBytes = g_cap.romBytes = g_cap.imageBytes = g_cap.untrackedBytes = 0;
+    g_cap.heapBlocks = g_cap.romBlocks = g_cap.imageBlocks = 0;
+    g_cap.mallocBlocks = g_cap.untrackedRefs = 0;
+    g_cap.heapBytes = g_cap.romBytes = g_cap.imageBytes = 0;
+    g_cap.mallocBytes = g_cap.untrackedBytes = 0;
     g_cap.goldenRgb.clear();
     g_cap.frameOpen = false;
     ++g_cap.frameIndex;

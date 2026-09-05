@@ -278,23 +278,160 @@ void sysGetHomePath(char *outPath, const u32 outLen)
 	SDL_free(sdlPath);
 }
 
+/*
+ * Live-allocation registry.
+ *
+ * The RT64 backend must never dereference a pointer it cannot prove is mapped.
+ * Room graphics data is plain malloc on this platform (bgLoadRoom,
+ * src/game/bg.c:2839, "allocate room data from heap to not take up mema
+ * space"), so it lies outside every region the backend models - heap, ROM
+ * image and executable image - and the backend has no choice but to refuse it.
+ * Recording what sysMemAlloc hands out lets it classify those pointers
+ * instead. Display lists point into the MIDDLE of a room block, so the
+ * question is "which allocation contains this address", not "is this a base
+ * pointer": the table is kept sorted and searched by containment.
+ *
+ * Cost: insertions are O(n) memmove but happen only at load time - every call
+ * site is romdata, preprocess or bgLoadRoom, none per-frame - while lookups
+ * are per-display-list-command and O(log n).
+ *
+ * No locking, because the port allocates only on the main thread: it creates
+ * no threads (no SDL_CreateThread or pthread_create anywhere in port/src or
+ * src/lib) and uses SDL's queue audio API rather than a callback thread
+ * (port/src/audio.c:29 sets want.callback = NULL).
+ *
+ * The table itself uses malloc/realloc directly rather than the sysMem
+ * wrappers, so tracking never recurses into itself.
+ */
+struct sysAllocEntry {
+	uintptr_t base;
+	u32 size;
+};
+
+static struct sysAllocEntry *g_SysAllocs = NULL;
+static u32 g_SysAllocCount = 0;
+static u32 g_SysAllocCap = 0;
+
+/* Index of the first entry whose base is >= addr. */
+static u32 sysAllocLowerBound(const uintptr_t addr)
+{
+	u32 lo = 0;
+	u32 hi = g_SysAllocCount;
+
+	while (lo < hi) {
+		const u32 mid = lo + (hi - lo) / 2;
+		if (g_SysAllocs[mid].base < addr) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+
+	return lo;
+}
+
+static void sysAllocTrack(void *ptr, const u32 size)
+{
+	const uintptr_t base = (uintptr_t)ptr;
+	u32 at;
+
+	if (!ptr || !size) {
+		return;
+	}
+
+	if (g_SysAllocCount == g_SysAllocCap) {
+		const u32 cap = g_SysAllocCap ? g_SysAllocCap * 2 : 128;
+		struct sysAllocEntry *grown = realloc(g_SysAllocs, cap * sizeof(struct sysAllocEntry));
+		if (!grown) {
+			/* Out of memory for the registry alone. Dropping the entry
+			 * costs the backend a classification, not correctness: an
+			 * unclassified pointer is refused, never blindly read. */
+			return;
+		}
+		g_SysAllocs = grown;
+		g_SysAllocCap = cap;
+	}
+
+	at = sysAllocLowerBound(base);
+	memmove(&g_SysAllocs[at + 1], &g_SysAllocs[at],
+			(g_SysAllocCount - at) * sizeof(struct sysAllocEntry));
+	g_SysAllocs[at].base = base;
+	g_SysAllocs[at].size = size;
+	++g_SysAllocCount;
+}
+
+static void sysAllocUntrack(void *ptr)
+{
+	const uintptr_t base = (uintptr_t)ptr;
+	u32 at;
+
+	if (!ptr || !g_SysAllocCount) {
+		return;
+	}
+
+	at = sysAllocLowerBound(base);
+	if (at >= g_SysAllocCount || g_SysAllocs[at].base != base) {
+		return;
+	}
+
+	memmove(&g_SysAllocs[at], &g_SysAllocs[at + 1],
+			(g_SysAllocCount - at - 1) * sizeof(struct sysAllocEntry));
+	--g_SysAllocCount;
+}
+
+s32 sysMemIsTracked(const void *addr, const u32 len)
+{
+	const uintptr_t a = (uintptr_t)addr;
+	u32 at;
+
+	if (!addr || !len || !g_SysAllocCount) {
+		return 0;
+	}
+
+	/* The containing allocation is the last one starting at or before addr. */
+	at = sysAllocLowerBound(a);
+	if (at >= g_SysAllocCount || g_SysAllocs[at].base != a) {
+		if (at == 0) {
+			return 0;
+		}
+		--at;
+	}
+
+	/* Check the length against the block before subtracting it, or the u32
+	 * arithmetic underflows and every oversized read looks contained. */
+	if (a < g_SysAllocs[at].base || len > g_SysAllocs[at].size) {
+		return 0;
+	}
+
+	return (a - g_SysAllocs[at].base) <= (uintptr_t)(g_SysAllocs[at].size - len);
+}
+
 void *sysMemAlloc(const u32 size)
 {
-	return malloc(size);
+	void *ptr = malloc(size);
+	sysAllocTrack(ptr, size);
+	return ptr;
 }
 
 void *sysMemZeroAlloc(const u32 size)
 {
-	return calloc(1, size);
+	void *ptr = calloc(1, size);
+	sysAllocTrack(ptr, size);
+	return ptr;
 }
 
 void *sysMemRealloc(void *ptr, const u32 newSize)
 {
-	return realloc(ptr, newSize);
+	void *out;
+	sysAllocUntrack(ptr);
+	out = realloc(ptr, newSize);
+	sysAllocTrack(out, newSize);
+	return out;
 }
 
 void sysMemFree(void *ptr)
 {
+	sysAllocUntrack(ptr);
 	free(ptr);
 }
 

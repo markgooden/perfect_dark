@@ -136,18 +136,39 @@ enum class Swizzle : uint8_t {
  *          it ~12 times per frame; that was an inference and it was wrong.
  *          Kept because classifying it costs nothing and proves the absence,
  *          but do NOT design a large immutable-ROM cache tier around it.
+ *   Malloc room graphics data, 25-35 KB/frame in gameplay. bgLoadRoom uses
+ *          plain sysMemAlloc on this platform (src/game/bg.c:2839), so it is
+ *          in none of the spans above. It is not one contiguous range, so it
+ *          is classified by asking the port's allocation registry
+ *          (sysMemIsTracked) rather than by a bounds test.
  *
  * Immutability, which is what the arena's caching policy turns on: Image and
  * Rom never change after load, so blocks from them can be marshalled once and
- * kept. Heap blocks are rewritten between frames and cannot.
+ * kept. Heap blocks are rewritten between frames and cannot. Malloc blocks
+ * measured byte-stable across every captured frame (docs/census.md) but the
+ * referenced set grows as rooms come into view, so cache them append-only and
+ * drop the lot on stage load.
  */
 enum class Region : uint8_t {
-    None,       // not in any region we can safely read
+    None,       // not in any region we can prove is mapped: never dereference
     Heap,       // g_MempHeap: display lists, vertices, matrices, colours
     Rom,        // g_RomFile: the loaded ROM image; immutable
     Image,      // the executable's own image: linker-placed statics; immutable
-    Untracked,  // a mapped allocation we do not model
+    Malloc,     // a live sysMemAlloc block, proven mapped by the registry:
+                // room graphics data in practice
 };
+
+/*
+ * Predicate for Region::Malloc: "does the port have a live allocation covering
+ * [addr, addr+len)?". Backed by sysMemIsTracked in port/src/system.c.
+ *
+ * Injected as a plain function pointer rather than called directly so this
+ * translation unit keeps its no-dependency property - the unit tests compile
+ * rt64_mem.cpp with nothing but the toolchain, and pass their own fake. A null
+ * predicate means "no registry", and such pointers then classify as None and
+ * are refused, which is the safe failure.
+ */
+using TrackedAllocFn = bool (*)(uintptr_t addr, size_t len);
 
 /*
  * Abstract source-memory reader. Two implementations:
@@ -186,13 +207,15 @@ class LiveMemReader final : public MemReader {
 public:
     LiveMemReader(const uint8_t *heapBase, size_t heapSize,
                   const uint8_t *romBase, size_t romSize,
-                  const uint8_t *imageBase = nullptr, size_t imageSize = 0);
+                  const uint8_t *imageBase = nullptr, size_t imageSize = 0,
+                  TrackedAllocFn tracked = nullptr);
     bool read(uintptr_t src, void *dst, size_t len) override;
     Region regionOf(uintptr_t src, size_t len) const override;
 
 private:
     struct Span { uintptr_t base; size_t size; };
     Span heap_, rom_, image_;
+    TrackedAllocFn tracked_;
 };
 
 /*

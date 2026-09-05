@@ -129,10 +129,12 @@ void marshalCopy(void *dst, const void *src, size_t len, Swizzle type)
 
 LiveMemReader::LiveMemReader(const uint8_t *heapBase, size_t heapSize,
                              const uint8_t *romBase, size_t romSize,
-                             const uint8_t *imageBase, size_t imageSize)
+                             const uint8_t *imageBase, size_t imageSize,
+                             TrackedAllocFn tracked)
     : heap_{reinterpret_cast<uintptr_t>(heapBase), heapSize},
       rom_{reinterpret_cast<uintptr_t>(romBase), romSize},
-      image_{reinterpret_cast<uintptr_t>(imageBase), imageSize}
+      image_{reinterpret_cast<uintptr_t>(imageBase), imageSize},
+      tracked_(tracked)
 {
 }
 
@@ -146,6 +148,11 @@ Region LiveMemReader::regionOf(uintptr_t src, size_t len) const
     }
     if (spanContains(image_.base, image_.size, src, len)) {
         return Region::Image;
+    }
+    /* Last, and only if a registry was supplied: the spans are cheap bounds
+     * tests, the registry is a binary search. */
+    if (tracked_ && src && len && tracked_(src, len)) {
+        return Region::Malloc;
     }
     return Region::None;
 }

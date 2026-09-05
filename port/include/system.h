@@ -35,6 +35,13 @@ void *sysMemZeroAlloc(const u32 size);
 void *sysMemRealloc(void *ptr, const u32 newSize);
 void sysMemFree(void *ptr);
 
+// True if [addr, addr+len) lies entirely inside one live sysMem allocation.
+// The RT64 backend uses this to prove a pointer is mapped before reading it:
+// room graphics data is sysMemAlloc'd (src/game/bg.c:2839) and so falls
+// outside every memory region that backend models. See system.c for why the
+// registry needs no locking.
+s32 sysMemIsTracked(const void *addr, const u32 len);
+
 // hns is specified in 100ns units
 void sysSleep(const s64 hns);
 
