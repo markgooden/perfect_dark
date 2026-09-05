@@ -25,6 +25,11 @@ extern "C" {
  * Called from videoInit when --capture-frames is passed. */
 void pdCaptureArm(const char *pathPrefix, int frames);
 
+/* Arms capture on an F9 keypress instead of a fixed frame count. Far easier
+ * than timing --capture-skip against a frame counter: get where you want in
+ * the game, press F9. Set up from videoInit when --capture-key is passed. */
+void pdCaptureSetupHotkey(const char *pathPrefix, int frames);
+
 /* Called by the dispatch layer for every gfx_run, before the backend sees
  * the list. Records the display list and everything it references. */
 void pdCaptureOnRun(const Gfx *rootDl);

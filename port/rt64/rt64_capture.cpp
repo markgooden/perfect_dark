@@ -31,6 +31,8 @@
 #include <windows.h>
 #endif
 
+#include <SDL.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -101,8 +103,15 @@ struct CaptureState {
      * Untracked references are counted but never dereferenced - we cannot
      * prove those pages are mapped, and a bad read would take the game down
      * mid-capture. */
+    uint32_t parseBails = 0;   /* lists abandoned on an unknown opcode */
     uint32_t heapBlocks = 0, romBlocks = 0, imageBlocks = 0, untrackedRefs = 0;
     uint64_t heapBytes = 0, romBytes = 0, imageBytes = 0, untrackedBytes = 0;
+
+    /* Hotkey arming: --capture-key sets these up, F9 fires them. */
+    bool hotkeyEnabled = false;
+    bool hotkeyWasDown = false;
+    int hotkeyFrames = 0;
+    std::string hotkeyPrefix;
 
     /* Golden image for this frame, if the backend supplied one. */
     std::vector<uint8_t> goldenRgb;
@@ -228,6 +237,48 @@ void recordRange(uintptr_t addr, size_t len)
     std::vector<uint8_t> bytes(len);
     memcpy(bytes.data(), (const void *)addr, len);
     g_cap.ranges[addr] = std::move(bytes);
+}
+
+/*
+ * Every opcode gfx_run_dl accepts (gfx_pc.cpp:2286-2534). Anything else means
+ * the walk has drifted out of alignment and is parsing data as commands -
+ * fast3d itself calls sysFatalError in that case. We stop the list instead,
+ * which bounds the damage to one branch rather than letting a bad pointer
+ * generate nonsense references across the whole frame.
+ */
+bool isKnownOpcode(uint8_t op)
+{
+    switch (op) {
+    /* RSP */
+    /* Opcode 0 is G_POPMTX here: the port's gbi.h defines G_SPNOOP, G_POPMTX
+     * and G_CULLDL all as 0, and fast3d's switch treats 0 as G_POPMTX. Mirror
+     * that rather than inventing a second meaning for the value. */
+    case G_MTX: case G_MOVEMEM: case G_VTX: case G_DL:
+    case G_COL: case (uint8_t)G_POPMTX: case (uint8_t)G_MOVEWORD:
+    case (uint8_t)G_TEXTURE: case (uint8_t)G_SETOTHERMODE_H:
+    case (uint8_t)G_SETOTHERMODE_L: case (uint8_t)G_ENDDL:
+    case (uint8_t)G_SETGEOMETRYMODE: case (uint8_t)G_CLEARGEOMETRYMODE:
+    case (uint8_t)G_TRI1: case (uint8_t)G_TRI4:
+    case (uint8_t)G_RDPHALF_1: case (uint8_t)G_RDPHALF_2:
+    case (uint8_t)G_RDPHALF_CONT: case G_NOOP:
+    /* RDP */
+    case G_SETTIMG: case G_SETCIMG: case G_SETZIMG: case G_SETCOMBINE:
+    case G_SETTILE: case G_SETTILESIZE: case G_LOADTILE: case G_LOADBLOCK:
+    case G_LOADTLUT: case G_SETENVCOLOR: case G_SETPRIMCOLOR:
+    case G_SETFOGCOLOR: case G_SETFILLCOLOR: case G_SETSCISSOR:
+    case G_RDPSETOTHERMODE: case G_TEXRECT: case G_TEXRECTFLIP:
+    case G_FILLRECT: case G_RDPLOADSYNC: case G_RDPPIPESYNC:
+    case G_RDPTILESYNC: case G_RDPFULLSYNC:
+    /* port-private (src/include/gbiex.h:187-199) */
+    case G_SETFB_EXT: case G_SETTIMG_FB_EXT: case G_INVALTEXCACHE_EXT:
+    case G_TEXRECT_WIDE_EXT: case G_FILLRECT_WIDE_EXT: case G_SETGRAYSCALE_EXT:
+    case G_EXTRAGEOMETRYMODE_EXT: case G_SETINTENSITY_EXT: case G_COPYFB_EXT:
+    case G_IMAGERECT_EXT: case G_RDPFLUSH_EXT: case G_CLEAR_DEPTH_EXT:
+    case G_SETSUBPIXELOFFSET_EXT:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* Number of Gfx words each opcode consumes, mirroring gfx_run_dl's ++cmd
@@ -370,6 +421,13 @@ void walkDl(const Gfx *cmd, int depth)
         }
 
         const uint8_t opcode = (uint8_t)(cmd->words.w0 >> 24);
+        if (!isKnownOpcode(opcode)) {
+            /* Drifted: stop this list rather than manufacture references from
+             * whatever the bytes happen to look like. */
+            ++g_cap.parseBails;
+            return;
+        }
+
         const uint32_t words = commandWords(opcode);
         recordRange((uintptr_t)cmd, sizeof(Gfx) * words);
 
@@ -443,6 +501,10 @@ void flushFrame(void)
                      g_cap.romBlocks, (unsigned long long)g_cap.romBytes,
                      g_cap.imageBlocks, (unsigned long long)g_cap.imageBytes,
                      g_cap.untrackedRefs, (unsigned long long)g_cap.untrackedBytes);
+        if (g_cap.parseBails) {
+            sysLogPrintf(LOG_WARNING, "census: %u display list(s) abandoned on an "
+                         "unknown opcode - capture is incomplete", g_cap.parseBails);
+        }
     }
 
     if (!g_cap.goldenRgb.empty()) {
@@ -453,6 +515,7 @@ void flushFrame(void)
 
     g_cap.roots.clear();
     g_cap.ranges.clear();
+    g_cap.parseBails = 0;
     g_cap.heapBlocks = g_cap.romBlocks = g_cap.imageBlocks = g_cap.untrackedRefs = 0;
     g_cap.heapBytes = g_cap.romBytes = g_cap.imageBytes = g_cap.untrackedBytes = 0;
     g_cap.goldenRgb.clear();
@@ -532,6 +595,19 @@ void writePng(const std::string &path, const uint8_t *rgbBottomUp, int w, int h)
 
 /* ---- C entry points ---- */
 
+extern "C" void pdCaptureSetupHotkey(const char *pathPrefix, int frames)
+{
+    if (!pathPrefix || frames <= 0) {
+        return;
+    }
+    g_cap.hotkeyEnabled = true;
+    g_cap.hotkeyPrefix = pathPrefix;
+    g_cap.hotkeyFrames = frames;
+    initImageRegion();
+    sysLogPrintf(LOG_NOTE, "capture: press F9 to capture %d frames to '%s'",
+                 frames, pathPrefix);
+}
+
 extern "C" void pdCaptureArm(const char *pathPrefix, int frames)
 {
     if (!pathPrefix || frames <= 0) {
@@ -565,17 +641,6 @@ extern "C" void pdCaptureOnRun(const Gfx *rootDl)
         return;
     }
 
-    /* NOT seeded from f3d_get_segment_table(). Tried and reverted: capture
-     * runs before the backend, so that table holds the PREVIOUS frame's
-     * values, and PD rebinds segments per frame against double-buffered
-     * pools. Seeding resolved segmented addresses to the other buffer -
-     * mapped memory, so no crash, but the walker then parsed vertex data as
-     * commands and produced nonsense references (0x0400fcb200a604a1 and
-     * friends). Getting this right needs PD's per-frame segment lifecycle,
-     * which is translator work; see docs/census.md.
-     * Consequence: segmented addresses whose segment is bound before the
-     * first captured frame stay unresolved and are counted as untracked. */
-
     g_cap.frameOpen = true;
     g_cap.roots.push_back((uintptr_t)rootDl);
     walkDl(rootDl, 0);
@@ -592,8 +657,29 @@ extern "C" void pdCaptureGoldenImage(const unsigned char *pixels, int width, int
     g_cap.goldenH = height;
 }
 
+/* Edge-triggered so holding the key does not re-arm every frame. */
+static void pdCapturePollHotkey(void)
+{
+    if (!g_cap.hotkeyEnabled || pdCaptureActive()) {
+        return;
+    }
+
+    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+    if (!keys) {
+        return;
+    }
+
+    const bool down = keys[SDL_SCANCODE_F9] != 0;
+    if (down && !g_cap.hotkeyWasDown) {
+        pdCaptureArm(g_cap.hotkeyPrefix.c_str(), g_cap.hotkeyFrames);
+    }
+    g_cap.hotkeyWasDown = down;
+}
+
 extern "C" void pdCaptureEndFrame(void)
 {
+    pdCapturePollHotkey();
+
     if (!pdCaptureActive()) {
         return;
     }
@@ -615,6 +701,25 @@ extern "C" void pdCaptureEndFrame(void)
         return;
     }
 
+    /* NOT seeded from f3d_get_segment_table(), and not walked here.
+     *
+     * Three attempts, all producing corrupt references, recorded so nobody
+     * repeats them: (1) seed at submit time - fast3d's table is a frame stale;
+     * (2) same, plus an unknown-opcode guard - deeper walk, still drifted;
+     * (3) walk at end of frame with the post-frame table, which should have
+     * matched the list exactly - drifted from frame 0.
+     *
+     * What (3) ruled out: staleness is not the cause. The tell is a reference
+     * to 0x04300030, an unresolved segment-4 address. fast3d never
+     * dereferences that, or it would crash - so the walker is following
+     * branches fast3d does not follow, and no amount of segment seeding fixes
+     * a walk that reaches lists the renderer never executes. Resolving that
+     * needs PD's display-list structure understood properly, which is T5.
+     *
+     * Consequence, and it is significant: gameplay captures record only the
+     * ~26 KB the walker can reach without segment resolution, and no vertex
+     * data at all. See docs/census.md.
+     */
     flushFrame();
     if (--g_cap.framesLeft <= 0) {
         g_cap.armed = false;

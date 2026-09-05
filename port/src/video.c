@@ -90,7 +90,12 @@ s32 videoInit(void)
 	const s32 captureFrames = sysArgGetInt("--capture-frames", 0);
 	if (captureFrames > 0) {
 		const char *prefix = sysArgGetString("--capture-prefix");
-		pdCaptureArm(prefix ? prefix : "pdcapture", captureFrames);
+		const char *name = prefix ? prefix : "pdcapture";
+		if (sysArgCheck("--capture-key")) {
+			pdCaptureSetupHotkey(name, captureFrames);
+		} else {
+			pdCaptureArm(name, captureFrames);
+		}
 	}
 
 	gfx_current_native_viewport.width = 320;
