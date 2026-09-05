@@ -2309,6 +2309,11 @@ static void gfx_run_dl(Gfx* cmd) {
     for (;;) {
         uint32_t opcode = cmd->words.w0 >> 24;
         // gfx_print_cmd(cmd);
+        if (pdCaptureCommandHook) {
+            /* Capture sees every command with the segment table exactly as
+             * seg_addr is about to use it, so it cannot diverge from us. */
+            pdCaptureCommandHook(cmd, segmentPointers);
+        }
         switch (opcode) {
                 // RSP commands:
             case G_NOOP:

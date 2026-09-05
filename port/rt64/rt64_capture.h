@@ -18,7 +18,17 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
 #include <PR/gbi.h>
+
+/* Per-command hook, called by fast3d's gfx_run_dl for every command it
+ * executes, with its live segment table (16 entries) as seg_addr is about to
+ * use it. Non-null only while capture is armed, so the interpreter pays one
+ * pointer test per command otherwise. Capture records from here rather than
+ * walking the list itself: the interpreter is the definition of which
+ * commands a frame contains, and any independent walk can only be checked
+ * against it, never trusted over it. */
+extern void (*pdCaptureCommandHook)(const Gfx *cmd, const uintptr_t *segments);
 
 /* Arms capture for the next `frames` frames. Files are written as
  * <prefix>.NNNN.pddl, with a golden image alongside as <prefix>.NNNN.png.

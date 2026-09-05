@@ -1,12 +1,20 @@
 /*
  * Display-list capture.
  *
- * Walks each submitted display list exactly as gfx_run_dl does
- * (port/fast3d/gfx_pc.cpp:2286-2534) and records:
+ * Records, from inside fast3d's interpreter (pdCaptureCommandHook, called by
+ * gfx_run_dl for every command it executes):
  *
  *   - every Gfx command word of the stream, including nested lists
  *   - the contents of every block the stream references: vertices, colour
  *     tables, matrices, movemem blocks, texture data and TLUTs
+ *
+ * Segmented addresses are resolved with the table fast3d hands us at each
+ * command, so the capture cannot disagree with the renderer about what a
+ * frame contains. The independent walker that used to drive capture is kept
+ * as a self-check (verifyWalk): after each frame it re-walks the list from
+ * the same starting state and reports the first command it reaches that
+ * fast3d did not execute. The translator needs exactly such a walk, so the
+ * check is the proof that one can be written to match.
  *
  * Blocks are stored at their ORIGINAL host addresses so a replay can resolve
  * a display-list pointer by lookup. Sizes for texture data are derived the
@@ -38,6 +46,7 @@
 #include <cstring>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -94,16 +103,21 @@ struct CaptureState {
     std::map<uintptr_t, std::vector<uint8_t>> ranges;
     bool frameOpen = false;
 
+    /* Every command address fast3d executed this frame, and the segment table
+     * as it stood when the root was submitted. Together they let verifyWalk
+     * replay the frame independently and be checked against the truth. */
+    std::set<uintptr_t> executed;
+    uint32_t executedCount = 0;
+    uintptr_t seedSegments[16] = {};
+
     /* Mirrors rdp.texture_to_load so load commands can size the block. */
     uintptr_t texAddr = 0;
     uint32_t texSiz = 0;
     uint32_t texWidth = 0;
 
-    /* Census (T3-lite): per-region accounting of what the walk referenced.
-     * Untracked references are counted but never dereferenced - we cannot
-     * prove those pages are mapped, and a bad read would take the game down
-     * mid-capture. */
-    uint32_t parseBails = 0;   /* lists abandoned on an unknown opcode */
+    /* Census (T3-lite): per-region accounting of what the frame referenced.
+     * "untracked" is anything outside heap, ROM and image - in practice the
+     * malloc'd room graphics blocks (see recordRange). */
     uint32_t heapBlocks = 0, romBlocks = 0, imageBlocks = 0, untrackedRefs = 0;
     uint64_t heapBytes = 0, romBytes = 0, imageBytes = 0, untrackedBytes = 0;
 
@@ -121,16 +135,15 @@ struct CaptureState {
 
 CaptureState g_cap;
 
-/* Segment table mirror. The port flags segmented addresses with the low bit
- * set (gfx_pc.cpp:2262-2273); anything else is a raw host pointer. */
-uintptr_t g_segments[16];
-
-void *segAddr(uintptr_t w1)
+/* Same resolution as fast3d's seg_addr (gfx_pc.cpp:2285-2296). The port flags
+ * segmented addresses with the low bit set; anything else is a raw host
+ * pointer. `segments` is whichever table the caller is executing against. */
+void *segAddr(uintptr_t w1, const uintptr_t *segments)
 {
     if (w1 & 1) {
         const uintptr_t seg = (w1 & 0x0f000000) >> 24;
-        if (seg && g_segments[seg]) {
-            return (void *)(g_segments[seg] + (w1 & 0x00fffffe));
+        if (seg && segments[seg]) {
+            return (void *)(segments[seg] + (w1 & 0x00fffffe));
         }
     }
     return (void *)w1;
@@ -180,42 +193,23 @@ bool inHeap(uintptr_t addr, size_t len)
     return inRegion(addr, len, g_MempHeap, g_MempHeapSize);
 }
 
-/* The memp heap is not the only region display lists point into: the menu
- * references the loaded ROM image directly (12 commands per frame at
- * STAGE_CITRAINING). Both regions must be captured, and the translator will
- * have to marshal from both. */
+/* The memp heap is not the only region display lists point into; statics in
+ * the executable image are the other one that matters (docs/census.md). */
 bool inImage(uintptr_t addr, size_t len)
 {
     return g_imageSize && addr >= g_imageBase &&
            (addr + len) <= (g_imageBase + g_imageSize);
 }
 
-bool inCapturableMemory(uintptr_t addr, size_t len)
-{
-    return inHeap(addr, len) || inRegion(addr, len, g_RomFile, g_RomFileSize) ||
-           inImage(addr, len);
-}
-
-/* Records [addr, addr+len). Refuses anything outside the memp heap: the
- * capture must never dereference a pointer we cannot prove is mapped, and
- * out-of-heap references are exactly what task T3 exists to census. */
+/* Records [addr, addr+len). Every range comes from a command fast3d is about
+ * to execute, at a size derived the way fast3d derives it, so fast3d itself
+ * is about to read exactly these bytes: they are mapped or the game is
+ * already dead. That is what makes reading outside the modelled regions safe
+ * here, and it is the only reason it is safe - an independent walk has no
+ * such guarantee. */
 void recordRange(uintptr_t addr, size_t len)
 {
-    if (!len) {
-        return;
-    }
-
-    if (!inCapturableMemory(addr, len)) {
-        /* A real reference into an allocation we do not model - almost always
-         * reached through a G_MOVEWORD segment base. Size it, do not read it. */
-        ++g_cap.untrackedRefs;
-        g_cap.untrackedBytes += len;
-        /* Diagnostic: the first few addresses per frame, so they can be matched
-         * against the region spans logged at startup. */
-        if (g_cap.untrackedRefs <= 4) {
-            sysLogPrintf(LOG_NOTE, "census: untracked ref %p (%u bytes)",
-                         (void *)addr, (unsigned)len);
-        }
+    if (!addr || !len) {
         return;
     }
 
@@ -225,9 +219,15 @@ void recordRange(uintptr_t addr, size_t len)
     } else if (inImage(addr, len)) {
         ++g_cap.imageBlocks;
         g_cap.imageBytes += len;
-    } else {
+    } else if (inRegion(addr, len, g_RomFile, g_RomFileSize)) {
         ++g_cap.romBlocks;
         g_cap.romBytes += len;
+    } else {
+        /* Outside every modelled region. Measured, this is room graphics
+         * data: bgLoadRoom allocates it with plain malloc on the port
+         * (src/game/bg.c:2839), so it is neither heap nor romdata. */
+        ++g_cap.untrackedRefs;
+        g_cap.untrackedBytes += len;
     }
 
     auto it = g_cap.ranges.find(addr);
@@ -240,11 +240,10 @@ void recordRange(uintptr_t addr, size_t len)
 }
 
 /*
- * Every opcode gfx_run_dl accepts (gfx_pc.cpp:2286-2534). Anything else means
- * the walk has drifted out of alignment and is parsing data as commands -
- * fast3d itself calls sysFatalError in that case. We stop the list instead,
- * which bounds the damage to one branch rather than letting a bad pointer
- * generate nonsense references across the whole frame.
+ * Every opcode gfx_run_dl accepts (gfx_pc.cpp:2286-2534). fast3d calls
+ * sysFatalError on anything else, so the hook never sees an unknown opcode;
+ * this exists for verifyWalk, where an unknown opcode means the independent
+ * walk has drifted and is reading data as commands.
  */
 bool isKnownOpcode(uint8_t op)
 {
@@ -298,8 +297,6 @@ uint32_t commandWords(uint8_t opcode)
     }
 }
 
-void walkDl(const Gfx *cmd, int depth);
-
 void recordTextureLoad(uint32_t sizeBytes, uint32_t startOffset)
 {
     if (g_cap.texAddr) {
@@ -307,46 +304,42 @@ void recordTextureLoad(uint32_t sizeBytes, uint32_t startOffset)
     }
 }
 
-void walkCommand(const Gfx *cmd, int depth, bool *stop, const Gfx **jumpTo)
+/*
+ * Records one command and the data it references. Called from fast3d for
+ * every command it executes; control flow (G_DL, G_ENDDL) and segment
+ * bindings (G_MOVEWORD) are the interpreter's business and need nothing here
+ * beyond the command bytes themselves.
+ */
+void recordCommand(const Gfx *cmd, const uintptr_t *segments)
 {
     const uint8_t opcode = (uint8_t)(cmd->words.w0 >> 24);
+    recordRange((uintptr_t)cmd, sizeof(Gfx) * commandWords(opcode));
 
     switch (opcode) {
     case G_MTX:
-        recordRange((uintptr_t)segAddr(cmd->words.w1), sizeof(Mtx));
+        recordRange((uintptr_t)segAddr(cmd->words.w1, segments), sizeof(Mtx));
         break;
 
     case G_MOVEMEM:
-        /* Lights, viewport and lookat blocks. Sizes vary by index and are not
-         * worth decoding here; one cache line covers every PD use. */
-        recordRange((uintptr_t)segAddr(cmd->words.w1), 64);
+        /* Lights, viewport and lookat blocks are all 16 bytes (sizeof(Light),
+         * sizeof(Vp)), and that is the most fast3d reads (gfx_sp_movemem).
+         * These can sit in small malloc'd blocks, so no rounding up. */
+        recordRange((uintptr_t)segAddr(cmd->words.w1, segments), 16);
         break;
 
-    case G_VTX: {
-        const uint32_t bytes = C0(cmd, 0, 16);
-        recordRange((uintptr_t)segAddr(cmd->words.w1), bytes);
-        break;
-    }
-
+    case G_VTX:
     case G_COL: {
-        /* gSPColor packs sizeof(Col)*n into w0[0:16] (gbiex.h:15-16). */
+        /* gSPVertex packs sizeof(Vtx)*n and gSPColor sizeof(Col)*n into
+         * w0[0:16] (gbi.h:1722, gbiex.h:15-16). */
         const uint32_t bytes = C0(cmd, 0, 16);
-        recordRange((uintptr_t)segAddr(cmd->words.w1), bytes);
+        recordRange((uintptr_t)segAddr(cmd->words.w1, segments), bytes);
         break;
     }
-
-    case G_MOVEWORD:
-        /* Track segment assignments so later segmented addresses resolve. */
-        if (C0(cmd, 0, 8) == G_MW_SEGMENT) {
-            const uint32_t index = (C0(cmd, 8, 16) >> 2) & 0x0f;
-            g_segments[index] = (uintptr_t)cmd->words.w1;
-        }
-        break;
 
     case G_SETTIMG:
         g_cap.texSiz = C0(cmd, 19, 2);
         g_cap.texWidth = C0(cmd, 0, 10);
-        g_cap.texAddr = (uintptr_t)segAddr(cmd->words.w1);
+        g_cap.texAddr = (uintptr_t)segAddr(cmd->words.w1, segments);
         break;
 
     case G_LOADBLOCK: {
@@ -384,65 +377,161 @@ void walkCommand(const Gfx *cmd, int depth, bool *stop, const Gfx **jumpTo)
         break;
     }
 
-    case G_DL: {
-        const Gfx *sub = (const Gfx *)segAddr(cmd->words.w1);
-        if (!sub) {
-            break;
-        }
-        if (C0(cmd, 16, 1) == 0) {
-            walkDl(sub, depth + 1);
-        } else {
-            *jumpTo = sub;
-        }
-        break;
-    }
-
-    case (uint8_t)G_ENDDL:
-        *stop = true;
-        break;
-
     default:
         break;
     }
 }
 
-void walkDl(const Gfx *cmd, int depth)
+void captureCommand(const Gfx *cmd, const uintptr_t *segments)
 {
-    if (!cmd || depth > 32) {
+    if (!g_cap.frameOpen) {
+        return;
+    }
+    ++g_cap.executedCount;
+    g_cap.executed.insert((uintptr_t)cmd);
+    recordCommand(cmd, segments);
+}
+
+/*
+ * Independent re-walk of the frame, structured like gfx_run_dl, starting from
+ * the segment table as it stood at submission. Records nothing; it only
+ * checks that every command it reaches is one fast3d executed. The first
+ * miss is logged with the chain of G_DL commands that led there, which is
+ * the information needed to see *why* the two disagree.
+ */
+struct WalkLink {
+    const Gfx *dlCmd;   /* the G_DL that entered this list, null for the root */
+    uintptr_t target;   /* where it resolved to */
+};
+
+struct VerifyState {
+    uintptr_t segments[16];
+    uint32_t visited = 0;
+    bool diverged = false;
+    std::vector<WalkLink> chain;
+};
+
+/* `cmd` is only dereferenced if fast3d executed it; otherwise we have no
+ * proof the address is mapped, which is the very thing being reported. */
+void verifyReport(VerifyState &vs, const Gfx *cmd, const char *why)
+{
+    vs.diverged = true;
+    if (g_cap.executed.count((uintptr_t)cmd)) {
+        sysLogPrintf(LOG_WARNING, "verify: %s at %p (op %02x w0 %08llx w1 %016llx) after %u commands",
+                     why, (const void *)cmd, (unsigned)(cmd->words.w0 >> 24),
+                     (unsigned long long)cmd->words.w0, (unsigned long long)cmd->words.w1,
+                     vs.visited);
+    } else {
+        sysLogPrintf(LOG_WARNING, "verify: %s at %p after %u commands",
+                     why, (const void *)cmd, vs.visited);
+    }
+    for (size_t i = vs.chain.size(); i-- > 0;) {
+        const WalkLink &l = vs.chain[i];
+        if (!l.dlCmd) {
+            sysLogPrintf(LOG_WARNING, "verify:   root %p", (const void *)l.target);
+            continue;
+        }
+        const uintptr_t w1 = l.dlCmd->words.w1;
+        const unsigned seg = (w1 & 1) ? (unsigned)((w1 & 0x0f000000) >> 24) : 0;
+        sysLogPrintf(LOG_WARNING, "verify:   via G_DL at %p w1 %016llx -> %p (seg %u base %016llx, %s)",
+                     (const void *)l.dlCmd, (unsigned long long)w1, (const void *)l.target,
+                     seg, (unsigned long long)(seg ? vs.segments[seg] : 0),
+                     C0(l.dlCmd, 16, 1) ? "branch" : "push");
+    }
+    sysLogPrintf(LOG_WARNING, "verify:   segments at failure:");
+    for (unsigned s = 1; s < 16; ++s) {
+        if (vs.segments[s]) {
+            sysLogPrintf(LOG_WARNING, "verify:     [%2u] %016llx", s, (unsigned long long)vs.segments[s]);
+        }
+    }
+}
+
+void verifyWalkDl(VerifyState &vs, const Gfx *cmd, int depth)
+{
+    if (!cmd || vs.diverged) {
+        return;
+    }
+    if (depth > 32) {
+        verifyReport(vs, cmd, "nesting deeper than 32");
         return;
     }
 
     for (;;) {
-        if (!inCapturableMemory((uintptr_t)cmd, sizeof(Gfx))) {
-            /* Display lists in static data or elsewhere outside the heap are
-             * recorded as a reference only; T3 censuses how often this
-             * happens. Stop walking rather than risk a bad dereference. */
+        if (vs.diverged) {
             return;
         }
-
+        /* Membership in the executed set is the only gate, and it is also
+         * the safety check: nothing is dereferenced until fast3d has. Room
+         * data is malloc'd and outside every modelled region, so a region
+         * test here would reject correct walks. */
+        if (!g_cap.executed.count((uintptr_t)cmd)) {
+            verifyReport(vs, cmd, "command fast3d did not execute");
+            return;
+        }
         const uint8_t opcode = (uint8_t)(cmd->words.w0 >> 24);
         if (!isKnownOpcode(opcode)) {
-            /* Drifted: stop this list rather than manufacture references from
-             * whatever the bytes happen to look like. */
-            ++g_cap.parseBails;
+            verifyReport(vs, cmd, "unknown opcode");
             return;
         }
+        ++vs.visited;
 
-        const uint32_t words = commandWords(opcode);
-        recordRange((uintptr_t)cmd, sizeof(Gfx) * words);
+        switch (opcode) {
+        case (uint8_t)G_MOVEWORD:
+            if (C0(cmd, 0, 8) == G_MW_SEGMENT) {
+                vs.segments[(C0(cmd, 8, 16) >> 2) & 0x0f] = (uintptr_t)cmd->words.w1;
+            }
+            break;
 
-        bool stop = false;
-        const Gfx *jumpTo = nullptr;
-        walkCommand(cmd, depth, &stop, &jumpTo);
-
-        if (stop) {
-            return;
-        }
-        if (jumpTo) {
-            cmd = jumpTo;
+        case G_DL: {
+            const Gfx *sub = (const Gfx *)segAddr(cmd->words.w1, vs.segments);
+            if (!sub) {
+                break;
+            }
+            vs.chain.push_back({cmd, (uintptr_t)sub});
+            if (C0(cmd, 16, 1) == 0) {
+                verifyWalkDl(vs, sub, depth + 1);
+                vs.chain.pop_back();
+                break;
+            }
+            /* Branch: this list continues at the target. Keep the link so the
+             * report shows how we got here. */
+            cmd = sub;
             continue;
         }
-        cmd += words;
+
+        case (uint8_t)G_ENDDL:
+            return;
+
+        default:
+            break;
+        }
+
+        cmd += commandWords(opcode);
+    }
+}
+
+void verifyWalk(void)
+{
+    VerifyState vs;
+    memcpy(vs.segments, g_cap.seedSegments, sizeof(vs.segments));
+
+    for (uintptr_t root : g_cap.roots) {
+        vs.chain.clear();
+        vs.chain.push_back({nullptr, root});
+        verifyWalkDl(vs, (const Gfx *)root, 0);
+        if (vs.diverged) {
+            break;
+        }
+    }
+
+    if (vs.diverged) {
+        sysLogPrintf(LOG_WARNING, "verify: independent walk DIVERGED after %u of %u commands",
+                     vs.visited, g_cap.executedCount);
+    } else if (vs.visited != g_cap.executedCount) {
+        sysLogPrintf(LOG_WARNING, "verify: independent walk visited %u commands, fast3d executed %u",
+                     vs.visited, g_cap.executedCount);
+    } else {
+        sysLogPrintf(LOG_NOTE, "verify: independent walk matches fast3d (%u commands)", vs.visited);
     }
 }
 
@@ -495,17 +584,16 @@ void flushFrame(void)
         sysLogPrintf(LOG_NOTE, "capture: wrote %s (%u dls, %u ranges, %llu bytes)",
                      path, (unsigned)g_cap.roots.size(), rangeCount,
                      (unsigned long long)rangeBytes);
-        sysLogPrintf(LOG_NOTE, "census: heap %u/%lluB | rom %u/%lluB | image %u/%lluB "
-                     "| untracked %u refs/%lluB",
+        sysLogPrintf(LOG_NOTE, "census: %u commands | heap %u/%lluB | rom %u/%lluB | image %u/%lluB "
+                     "| room(malloc) %u/%lluB",
+                     g_cap.executedCount,
                      g_cap.heapBlocks, (unsigned long long)g_cap.heapBytes,
                      g_cap.romBlocks, (unsigned long long)g_cap.romBytes,
                      g_cap.imageBlocks, (unsigned long long)g_cap.imageBytes,
                      g_cap.untrackedRefs, (unsigned long long)g_cap.untrackedBytes);
-        if (g_cap.parseBails) {
-            sysLogPrintf(LOG_WARNING, "census: %u display list(s) abandoned on an "
-                         "unknown opcode - capture is incomplete", g_cap.parseBails);
-        }
     }
+
+    verifyWalk();
 
     if (!g_cap.goldenRgb.empty()) {
         char pngPath[512];
@@ -515,7 +603,8 @@ void flushFrame(void)
 
     g_cap.roots.clear();
     g_cap.ranges.clear();
-    g_cap.parseBails = 0;
+    g_cap.executed.clear();
+    g_cap.executedCount = 0;
     g_cap.heapBlocks = g_cap.romBlocks = g_cap.imageBlocks = g_cap.untrackedRefs = 0;
     g_cap.heapBytes = g_cap.romBytes = g_cap.imageBytes = g_cap.untrackedBytes = 0;
     g_cap.goldenRgb.clear();
@@ -595,6 +684,8 @@ void writePng(const std::string &path, const uint8_t *rgbBottomUp, int w, int h)
 
 /* ---- C entry points ---- */
 
+void (*pdCaptureCommandHook)(const Gfx *cmd, const uintptr_t *segments) = nullptr;
+
 extern "C" void pdCaptureSetupHotkey(const char *pathPrefix, int frames)
 {
     if (!pathPrefix || frames <= 0) {
@@ -622,7 +713,7 @@ extern "C" void pdCaptureArm(const char *pathPrefix, int frames)
     g_cap.framesLeft = frames;
     g_cap.frameIndex = 0;
     g_cap.armed = true;
-    memset(g_segments, 0, sizeof(g_segments));
+    pdCaptureCommandHook = captureCommand;
     sysLogPrintf(LOG_NOTE, "capture: armed for %d frames, prefix '%s'", frames, pathPrefix);
 }
 
@@ -641,9 +732,15 @@ extern "C" void pdCaptureOnRun(const Gfx *rootDl)
         return;
     }
 
+    if (g_cap.roots.empty()) {
+        /* The table fast3d will start this frame with. Its bindings persist
+         * across frames (gfx_pc.cpp:2590 is the only reset), so this is the
+         * correct initial state for an independent walk, not a stale one. */
+        memcpy(g_cap.seedSegments, f3d_get_segment_table(), sizeof(g_cap.seedSegments));
+    }
     g_cap.frameOpen = true;
     g_cap.roots.push_back((uintptr_t)rootDl);
-    walkDl(rootDl, 0);
+    /* Recording happens in captureCommand as fast3d executes the list. */
 }
 
 extern "C" void pdCaptureGoldenImage(const unsigned char *pixels, int width, int height)
@@ -701,28 +798,19 @@ extern "C" void pdCaptureEndFrame(void)
         return;
     }
 
-    /* NOT seeded from f3d_get_segment_table(), and not walked here.
-     *
-     * Three attempts, all producing corrupt references, recorded so nobody
-     * repeats them: (1) seed at submit time - fast3d's table is a frame stale;
-     * (2) same, plus an unknown-opcode guard - deeper walk, still drifted;
-     * (3) walk at end of frame with the post-frame table, which should have
-     * matched the list exactly - drifted from frame 0.
-     *
-     * What (3) ruled out: staleness is not the cause. The tell is a reference
-     * to 0x04300030, an unresolved segment-4 address. fast3d never
-     * dereferences that, or it would crash - so the walker is following
-     * branches fast3d does not follow, and no amount of segment seeding fixes
-     * a walk that reaches lists the renderer never executes. Resolving that
-     * needs PD's display-list structure understood properly, which is T5.
-     *
-     * Consequence, and it is significant: gameplay captures record only the
-     * ~26 KB the walker can reach without segment resolution, and no vertex
-     * data at all. See docs/census.md.
-     */
+    if (g_cap.executedCount == 0) {
+        /* fast3d dropped the frame for pacing (f3d_run returns before
+         * gfx_run_dl when start_frame fails), so nothing was executed and
+         * there is nothing truthful to write. Try again next frame. */
+        g_cap.roots.clear();
+        g_cap.frameOpen = false;
+        return;
+    }
+
     flushFrame();
     if (--g_cap.framesLeft <= 0) {
         g_cap.armed = false;
+        pdCaptureCommandHook = nullptr;
         sysLogPrintf(LOG_NOTE, "capture: finished, %d frames written", g_cap.frameIndex);
         if (g_cap.quitWhenDone) {
             /* Clean exit so stdio buffers flush and the run length is
