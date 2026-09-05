@@ -6,10 +6,14 @@
  *
  * This is the offline half of the capture: rt64_capture.cpp writes these files
  * from inside the running game, and everything that consumes them - the unit
- * tests, tools/dlreplay - reads them through here. It is deliberately NOT in
- * the port's build: the game never reads a capture back. It is kept beside the
- * writer anyway so the two halves of the format sit in one directory and share
+ * tests, tools/dlreplay - reads them through here. It is kept beside the
+ * writer so the two halves of the format sit in one directory and share
  * kPddlVersion rather than drifting apart.
+ *
+ * The port's CMakeLists globs port/*.cpp (CMakeLists.txt:261), so this does
+ * get compiled into the game even though the game never reads a capture back.
+ * That is harmless - nothing calls it, and the linker drops it - but do not
+ * write code here that assumes otherwise.
  *
  * Like rt64_mem.cpp, this file depends on nothing but the standard library, so
  * the tests compile it directly with no port, RT64 or SDL.
