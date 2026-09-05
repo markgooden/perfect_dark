@@ -22,17 +22,10 @@
  * gfx_dp_load_tile at :1897, gfx_dp_load_tlut at :1833), because the size of
  * a G_SETTIMG block is only knowable from the load command that follows it.
  *
- * File format (.pddl, little-endian, matching docs/interfaces/rt64_debug.h):
- *
- *   header  { char magic[4] = "PDDL"; u32 version = 2; u32 dlCount;
- *             u32 nativeW; u32 nativeH; u64 heapBase; u64 heapSize;
- *             u64 romBase; u64 romSize; }
- *   dlCount x { u64 rootPtr }
- *   rangeCount x { u64 addr; u32 len; u8 bytes[len] }
- *   trailer { u32 rangeCount }
- *
- * The trailer carries the range count because ranges are streamed as they are
- * discovered and the total is not known when the header is written.
+ * The .pddl file format is documented once, in rt64_pddl.h, which also holds
+ * the reader and the shared kPddlVersion. Do not restate the layout here: the
+ * writer below and that reader are the two halves of one format and they drift
+ * the moment there are two descriptions of it.
  */
 
 #ifdef _WIN32
@@ -54,6 +47,7 @@
 #include <PR/ultratypes.h>
 
 #include "rt64_capture.h"
+#include "rt64_pddl.h"
 
 extern "C" {
 #include "platform.h"
@@ -76,7 +70,9 @@ extern u32 g_RomFileSize;
 
 namespace {
 
-constexpr uint32_t kPddlVersion = 2;
+/* The writer's version is the reader's version by construction: it comes from
+ * rt64_pddl.h, so the two halves of the format cannot drift apart. */
+using pdrt64::kPddlVersion;
 
 /* Same accessors gfx_run_dl uses. */
 static inline uint32_t C0(const Gfx *cmd, uint32_t pos, uint32_t width)
