@@ -180,7 +180,30 @@ public:
     void setValidationEnabled(bool enabled) { validate_ = enabled; }
     bool validationEnabled() const { return validate_; }
 
+    /* Emits G_EX_SETRENDERTORAM in each stream's prefix, which makes RT64
+     * write its native-resolution output back into the synthetic RDRAM colour
+     * image instead of only presenting it.
+     *
+     * This lives on the translator and not on the host, where
+     * docs/interfaces/rt64_host.h put it, because RT64 has no API for it: it
+     * is an extended GBI command the stream carries
+     * (rt64_gbi_extended.cpp:183-186). The replay harness turns it on to get
+     * pixels it can hash and compare; it costs performance and is off in
+     * normal play. */
+    void setRenderToRam(bool enabled) { renderToRam_ = enabled; }
+
+    /* Which arena image the game's own G_SETCIMG refers to this frame.
+     *
+     * The game names its back buffer; we render into synthetic RDRAM, so that
+     * has to be mapped onto whichever of the arena's main colour images is
+     * current. Until T8 this was hardcoded to image 0, which meant the second
+     * image was never drawn into while the VI alternated onto it - half the
+     * presented frames came from a buffer nothing had written. Callers set
+     * this in step with regsSetScanout. */
+    void setMainColorImage(RdramAddr image) { mainColorImage_ = image; }
+
 private:
+    RdramAddr currentMainColorImage() const;
     void emit(uint32_t w0, uint32_t w1);
     void emitStreamPrefix();
 
@@ -268,6 +291,8 @@ private:
     std::string error_;
     bool validate_ = true;
     bool invertCulling_ = false;
+    bool renderToRam_ = false;
+    RdramAddr mainColorImage_ = 0;
 };
 
 /* The extended opcode this translator registers with RT64. Must be nonzero and

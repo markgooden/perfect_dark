@@ -30,6 +30,7 @@ constexpr uint32_t kGexSetRdramExtendedV1 = 0x2C;  // rt64_extended_gbi.h:75
 constexpr uint32_t kGexTexRectV1 = 0x02;           // rt64_extended_gbi.h:33
 constexpr uint32_t kGexFillRectV1 = 0x03;          // rt64_extended_gbi.h:34
 constexpr uint32_t kGexOriginNone = 0x800;         // rt64_extended_gbi.h:84
+constexpr uint32_t kGexSetRenderToRamV1 = 0x12;     // rt64_extended_gbi.h:51
 
 /* Canonical opcodes, from RT64's F3D/F3DPD maps. Named here rather than
  * included so the numbers sit next to the lowering that uses them. */
@@ -164,12 +165,19 @@ void Translator::beginFrame()
     fbs_.fbSize(0, &nativeW, &nativeH);
     mainCimgW0_ = ((uint32_t)(uint8_t)G_SETCIMG << 24) | (2u << 19) |
                   ((nativeW ? nativeW - 1 : 0) & 0xfff);
-    mainCimg_ = fbs_.mainColorImage(0);
+    mainCimg_ = currentMainColorImage();
     boundCimgW0_ = mainCimgW0_;
     boundCimg_ = mainCimg_;
     otherModeH_ = 0;
     stats_ = TranslateStats{};
     error_.clear();
+}
+
+RdramAddr Translator::currentMainColorImage() const
+{
+    /* Defaults to the first image, so a caller that never sets one still
+     * renders somewhere sensible rather than to address zero. */
+    return mainColorImage_ ? mainColorImage_ : fbs_.mainColorImage(0);
 }
 
 void Translator::emit(uint32_t w0, uint32_t w1)
@@ -189,6 +197,11 @@ void Translator::emitStreamPrefix()
     /* Extended addressing on, so the tagged addresses below resolve
      * (rt64_gbi_extended.cpp:292-295). */
     emit(((uint32_t)kExtendedOpcode << 24) | kGexSetRdramExtendedV1, 1u);
+
+    if (renderToRam_) {
+        /* rt64_gbi_extended.cpp:183-186 reads the flag from w1 bit 0. */
+        emit(((uint32_t)kExtendedOpcode << 24) | kGexSetRenderToRamV1, 1u);
+    }
 }
 
 bool Translator::pushBlock(const GfxRef &ref, Swizzle type, bool cached, RdramAddr *out)
@@ -966,14 +979,14 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
         case (uint8_t)G_SETZIMG: {
             /* The game names its own framebuffers; we render into synthetic
              * RDRAM, so these are redirected to the arena's images rather than
-             * marshalled. Which of the two main colour images is current is the
-             * register block's business and is not modelled until T8, so the
-             * first is used unconditionally - correct for a single-buffered
-             * frame and the thing T8 has to replace. */
+             * marshalled. Which main colour image is current comes from the
+             * caller, which sets it in step with the VI scanout - rendering
+             * every frame into image 0 while the VI alternated meant half the
+             * presented frames came from a buffer nothing had drawn into. */
             const uint32_t w0 = (uint32_t)g[0].words.w0;
             const RdramAddr img = (opcode == (uint8_t)G_SETZIMG)
                                       ? fbs_.depthImage()
-                                      : fbs_.mainColorImage(0);
+                                      : currentMainColorImage();
             if (opcode == (uint8_t)G_SETCIMG) {
                 mainCimgW0_ = w0;
                 mainCimg_ = img;
