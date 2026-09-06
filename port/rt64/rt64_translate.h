@@ -213,6 +213,20 @@ public:
      * normal play. */
     void setRenderToRam(bool enabled) { renderToRam_ = enabled; }
 
+    /* Shifts RT64's viewport by whole quarter-pixels, through RT64's own
+     * G_EX_SETVIEWPORTALIGN. Measured 2026-09-06: RT64 draws the whole frame
+     * exactly half a pixel right and down of the OpenGL path, uniformly - the
+     * best-matching offset is +0.500,+0.500 in every quadrant separately - and
+     * that accounts for 29% of the in-level pixel difference. (-2,-2) cancels
+     * it. Off by default: it changes the emitted stream, so every .disasm
+     * golden would move, and which of the two conventions matches hardware is
+     * not established. See docs/EFFECTS-GAPS.md section 2c. */
+    void setViewportAlign(int16_t quarterX, int16_t quarterY)
+    {
+        vpAlignX_ = quarterX;
+        vpAlignY_ = quarterY;
+    }
+
     /*
      * Per-command observer, fired once per command in execution order with the
      * segment table exactly as this walk is about to use it - the same
@@ -365,6 +379,8 @@ private:
     bool validate_ = true;
     bool invertCulling_ = false;
     bool renderToRam_ = false;
+    int16_t vpAlignX_ = 0;
+    int16_t vpAlignY_ = 0;
     RdramAddr mainColorImage_ = 0;
     CommandHook hook_ = nullptr;
     std::vector<FbBlitRequest> pendingBlits_;

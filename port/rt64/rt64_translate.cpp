@@ -31,6 +31,7 @@ constexpr uint32_t kGexTexRectV1 = 0x02;           // rt64_extended_gbi.h:33
 constexpr uint32_t kGexFillRectV1 = 0x03;          // rt64_extended_gbi.h:34
 constexpr uint32_t kGexOriginNone = 0x800;         // rt64_extended_gbi.h:84
 constexpr uint32_t kGexSetRenderToRamV1 = 0x12;     // rt64_extended_gbi.h:51
+constexpr uint32_t kGexSetViewportAlignV1 = 0x07;  // rt64_extended_gbi.h:38
 
 /* Canonical opcodes, from RT64's F3D/F3DPD maps. Named here rather than
  * included so the numbers sit next to the lowering that uses them. */
@@ -210,6 +211,23 @@ void Translator::emitStreamPrefix()
     if (renderToRam_) {
         /* rt64_gbi_extended.cpp:183-186 reads the flag from w1 bit 0. */
         emit(((uint32_t)kExtendedOpcode << 24) | kGexSetRenderToRamV1, 1u);
+    }
+
+    if (vpAlignX_ || vpAlignY_) {
+        /*
+         * Two words (gEXSetViewportAlign, rt64_extended_gbi.h:278-286): the
+         * origin in w1[0:12] of the first, then the offsets in w0[16:16] and
+         * w0[0:16] of the second, which is how setViewportAlignV1 reads them
+         * back (rt64_gbi_extended.cpp:90-97).
+         *
+         * The offsets are added to vtrans before the divide by four
+         * (rt64_rsp.cpp:909-910), so they are quarter-pixels and are NOT
+         * pre-scaled here - unlike gEXSetScissorAlign, which multiplies by
+         * four in the macro. Origin NONE keeps RT64's own left/right handling;
+         * this is a straight translation, not an aspect-ratio anchor.
+         */
+        emit(((uint32_t)kExtendedOpcode << 24) | kGexSetViewportAlignV1, kGexOriginNone);
+        emit(((uint32_t)(uint16_t)vpAlignX_ << 16) | (uint32_t)(uint16_t)vpAlignY_, 0u);
     }
 }
 
