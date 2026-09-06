@@ -69,6 +69,14 @@ static f64 accumDelta = 0.0;
 static f64 fpsTime = 0.0;
 static s32 fpsNumFrames = 0;
 
+/* --frames N: run N frames and exit 0. Added for the RT64 bring-up runs,
+ * which have to be able to say "a thousand frames, clean log, exit 0" without
+ * a human closing the window. It lives here rather than in the scheduler's
+ * loop because that loop is decomp game code (invariant 2), and videoEndFrame
+ * is the port-layer function called exactly once per frame. Zero means run
+ * forever, which is every normal launch. */
+static s32 vidFrameLimit = 0;
+
 static s32 videoInitDisplayModes(void);
 void optionsMenuInit();
 
@@ -77,13 +85,23 @@ s32 videoInit(void)
 	wmAPI = &gfx_sdl;
 	renderingAPI = &gfx_opengl_api;
 
+	vidFrameLimit = sysArgGetInt("--frames", 0);
+
 	/* Pick the graphics backend before anything touches gfx_*. --renderer wins
-	 * over the config value; anything unrecognised falls back to fast3d. */
+	 * over the config value; anything unrecognised falls back to fast3d.
+	 *
+	 * The override is deliberately NOT written back into vidRenderer, which is
+	 * registered with the config system: assigning to it made a single
+	 * --renderer rt64 run rewrite the saved setting, so every later launch
+	 * came up on RT64 with nothing on the command line to say why. That was
+	 * harmless while the RT64 path refused to start, which is how it survived
+	 * T2, and is not harmless now that it runs. */
+	s32 renderer = vidRenderer;
 	const char *rendererArg = sysArgGetString("--renderer");
 	if (rendererArg) {
-		vidRenderer = (strcmp(rendererArg, "rt64") == 0) ? 1 : 0;
+		renderer = (strcmp(rendererArg, "rt64") == 0) ? 1 : 0;
 	}
-	gfx_select_backend(vidRenderer ? &gfx_rt64_api : &gfx_fast3d_api);
+	gfx_select_backend(renderer ? &gfx_rt64_api : &gfx_fast3d_api);
 	sysLogPrintf(LOG_NOTE, "video: %s backend", gfx_get_backend()->name);
 
 	/* Display-list capture (see port/rt64/rt64_capture.cpp). */
@@ -172,6 +190,16 @@ void videoEndFrame(void)
 
 	++frames;
 	++fpsNumFrames;
+
+	if (vidFrameLimit > 0 && (s32)frames >= vidFrameLimit) {
+		/* Shut the renderer down rather than letting exit() drop the process
+		 * with a live device: on the RT64 path the arena and the register
+		 * block are borrowed by code across a DLL boundary that has to stop
+		 * reading them first. */
+		sysLogPrintf(LOG_NOTE, "video: --frames %d reached, exiting", (int)vidFrameLimit);
+		gfx_destroy();
+		exit(0);
+	}
 
 	const f64 flipTime = wmAPI->get_time();
 	accumDelta += flipTime - endTime;

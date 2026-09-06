@@ -145,6 +145,13 @@ add_definitions(
   -D_LANGUAGE_C=1
   -DPAL=${VERSION_IS_PAL}
   -DVERSION=${VERSION}
+  # Selects the DLL loader in port/rt64/rt64_hostdll.cpp as the implementation
+  # of rt64_host.h. RT64 does not build under MinGW and this build is MinGW, so
+  # the renderer is reached across a C-ABI boundary instead of linked
+  # (docs/BUILD-RT64.md). Nothing is linked for it here: the loader resolves
+  # every entry point by name at run time, so a missing rt64shim.dll is a
+  # reportable condition rather than an executable that will not start.
+  -DPDRT64_WITH_RT64_DLL=1
 )
 
 if(TARGET_IS_64BIT)

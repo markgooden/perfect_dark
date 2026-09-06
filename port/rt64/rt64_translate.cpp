@@ -627,6 +627,14 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
             return TranslateStatus::UnknownOpcode;
         }
 
+        /* Before gfxStep, which is what updates the segment table: an
+         * observer has to see the bindings this command will be resolved
+         * against, not the ones it establishes. `at` rather than &g[0] -
+         * see setCommandHook. */
+        if (hook_) {
+            hook_((const Gfx *)at, st_.segments);
+        }
+
         const GfxRef ref = gfxStep(st_, &g[0]);
         ++stats_.commandsIn;
 

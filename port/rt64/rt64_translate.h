@@ -192,6 +192,27 @@ public:
      * normal play. */
     void setRenderToRam(bool enabled) { renderToRam_ = enabled; }
 
+    /*
+     * Per-command observer, fired once per command in execution order with the
+     * segment table exactly as this walk is about to use it - the same
+     * position and the same contract as fast3d's own hook
+     * (gfx_pc.cpp:2312-2316).
+     *
+     * It exists so display-list capture works on this path too. Capture used
+     * to record only from inside fast3d's interpreter, which meant that with
+     * the RT64 backend selected nothing was recorded at all - so the one frame
+     * you would most want to capture, the one RT64 renders wrongly, was the
+     * one frame you could not get.
+     *
+     * The observer is handed the command at its REAL address, not the copy
+     * this walk reads into, because capture identifies commands by address.
+     * That is sound only in-process, where the addresses in the list are live
+     * host pointers; the capture and test readers never install one, and the
+     * default is null so they pay a predictable branch and nothing else.
+     */
+    using CommandHook = void (*)(const Gfx *cmd, const uintptr_t *segments);
+    void setCommandHook(CommandHook hook) { hook_ = hook; }
+
     /* Which arena image the game's own G_SETCIMG refers to this frame.
      *
      * The game names its back buffer; we render into synthetic RDRAM, so that
@@ -293,6 +314,7 @@ private:
     bool invertCulling_ = false;
     bool renderToRam_ = false;
     RdramAddr mainColorImage_ = 0;
+    CommandHook hook_ = nullptr;
 };
 
 /* The extended opcode this translator registers with RT64. Must be nonzero and

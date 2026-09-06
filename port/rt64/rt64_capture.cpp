@@ -49,6 +49,7 @@
 #include "rt64_capture.h"
 #include "rt64_debug.h"
 #include "rt64_pddl.h"
+#include "rt64_regions.h"
 
 extern "C" {
 #include "platform.h"
@@ -138,43 +139,12 @@ void *segAddr(uintptr_t w1, const uintptr_t *segments)
     return (void *)pdrt64::gfxSegResolve(w1, segments);
 }
 
-/*
- * The executable's own image. Display lists reference static data compiled
- * into the binary - light and viewport blocks reached via G_MOVEMEM - which
- * is neither heap nor ROM. The image is mapped for the process lifetime, so
- * reading it is safe; bounds come from the PE headers rather than a guess.
- */
-uintptr_t g_imageBase = 0;
-size_t g_imageSize = 0;
-
-void initImageRegion(void)
-{
-#ifdef _WIN32
-    HMODULE mod = GetModuleHandleW(NULL);
-    if (!mod) {
-        return;
-    }
-    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)mod;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return;
-    }
-    const IMAGE_NT_HEADERS *nt =
-        (const IMAGE_NT_HEADERS *)((const uint8_t *)mod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
-        return;
-    }
-    g_imageBase = (uintptr_t)mod;
-    g_imageSize = (size_t)nt->OptionalHeader.SizeOfImage;
-#endif
-}
-
+/* The executable's own image, the ROM and the heap. Discovery of the image
+ * span moved to rt64_regions.cpp when the live backend needed the same answer;
+ * these stay as the names the rest of this file reads better with. */
 bool inRegion(uintptr_t addr, size_t len, const u8 *base, u32 size)
 {
-    if (!base || !addr || !len) {
-        return false;
-    }
-    const uintptr_t b = (uintptr_t)base;
-    return addr >= b && (addr + len) <= (b + (uintptr_t)size);
+    return pdrt64::regionsInSpan(addr, len, base, (size_t)size);
 }
 
 bool inHeap(uintptr_t addr, size_t len)
@@ -182,12 +152,9 @@ bool inHeap(uintptr_t addr, size_t len)
     return inRegion(addr, len, g_MempHeap, g_MempHeapSize);
 }
 
-/* The memp heap is not the only region display lists point into; statics in
- * the executable image are the other one that matters (docs/census.md). */
 bool inImage(uintptr_t addr, size_t len)
 {
-    return g_imageSize && addr >= g_imageBase &&
-           (addr + len) <= (g_imageBase + g_imageSize);
+    return pdrt64::regionsInImage(addr, len);
 }
 
 /* Records [addr, addr+len). Every range comes from a command fast3d is about
@@ -631,7 +598,7 @@ extern "C" void pdCaptureSetupHotkey(const char *pathPrefix, int frames)
     g_cap.hotkeyEnabled = true;
     g_cap.hotkeyPrefix = pathPrefix;
     g_cap.hotkeyFrames = frames;
-    initImageRegion();
+    pdrt64::regionsInit();
     sysLogPrintf(LOG_NOTE, "capture: press F9 to capture %d frames to '%s'",
                  frames, pathPrefix);
 }
@@ -641,7 +608,7 @@ extern "C" void pdCaptureArm(const char *pathPrefix, int frames)
     if (!pathPrefix || frames <= 0) {
         return;
     }
-    initImageRegion();
+    pdrt64::regionsInit();
     g_cap.quitWhenDone = sysArgCheck("--capture-quit") != 0;
     /* Levels spend their first frames on loading screens, which are not
      * representative. --capture-skip discards that many rendered frames. */
