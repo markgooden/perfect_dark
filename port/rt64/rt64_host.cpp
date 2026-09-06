@@ -5,6 +5,17 @@
  * compiles to nothing without PDRT64_WITH_RT64 so the port's MinGW build can
  * glob it without having RT64 on its include path.
  *
+ * Three build configurations select between three implementations of the same
+ * declarations, which is the whole point of the split:
+ *   PDRT64_WITH_RT64      - this file, calling RT64 directly. MSVC only, and
+ *                           what the replay harness uses.
+ *   PDRT64_WITH_RT64_DLL  - rt64_hostdll.cpp, calling rt64shim.dll. What the
+ *                           MinGW port uses; this file is then empty.
+ *   neither               - the refusal stub below, so the port links and
+ *                           fails at run time with a reason.
+ * hostResultName is deliberately not here: it lives in rt64_hostdll.cpp,
+ * which is the one translation unit present in all three.
+ *
  * One constraint that shapes the whole file: RT64's GBI header and the port's
  * PR/gbi.h define overlapping names, so no translation unit may include both.
  * Nothing here may include PR/gbi.h, which is why the interface above is
@@ -13,17 +24,16 @@
 
 #include "rt64_host.h"
 
-#ifndef PDRT64_WITH_RT64
+#if defined(PDRT64_WITH_RT64_DLL)
+
+/* rt64_hostdll.cpp provides the implementation by loading rt64shim.dll. */
+
+#elif !defined(PDRT64_WITH_RT64)
 
 namespace pdrt64 {
 
 /* Built without RT64. The declarations still resolve, so callers link and fail
  * at run time with a reason rather than failing to build. */
-const char *hostResultName(HostResult r)
-{
-    return r == HostResult::NotCompiledIn ? "built without RT64" : "unknown";
-}
-
 HostResult hostInit(const HostConfig &) { return HostResult::NotCompiledIn; }
 void hostShutdown() {}
 bool hostReady() { return false; }
@@ -154,23 +164,6 @@ bool selectPerfectDarkGbi(RT64::Application &app)
 
 } // namespace
 
-const char *hostResultName(HostResult r)
-{
-    switch (r) {
-    case HostResult::Ok:                       return "ok";
-    case HostResult::NotCompiledIn:            return "built without RT64";
-    case HostResult::AlreadyInitialised:       return "already initialised";
-    case HostResult::BadConfig:                return "incomplete host configuration";
-    case HostResult::DynamicLibrariesNotFound: return "graphics dynamic libraries not found";
-    case HostResult::InvalidGraphicsApi:       return "invalid graphics API";
-    case HostResult::GraphicsApiNotFound:      return "graphics API not found";
-    case HostResult::GraphicsDeviceNotFound:   return "no usable graphics device";
-    case HostResult::UcodeSelectionFailed:     return "could not select the F3DPD microcode";
-    case HostResult::Unknown:                  break;
-    }
-    return "unknown";
-}
-
 HostResult hostInit(const HostConfig &cfg)
 {
     if (g_host.app) {
@@ -261,4 +254,4 @@ void hostUpdateScreen()
 
 } // namespace pdrt64
 
-#endif // PDRT64_WITH_RT64
+#endif // implementation selection

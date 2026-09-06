@@ -14,9 +14,12 @@
  * the declarations below. The replay harness skips the DLL and links RT64
  * directly, which is why it can isolate translator bugs from boundary bugs.
  *
- * rt64_host.cpp compiles to nothing unless PDRT64_WITH_RT64 is defined, so the
- * port's build - which globs every .cpp under port/ - can carry the file
- * without needing RT64 on its include path.
+ * Which implementation answers these declarations is a build-time choice:
+ * rt64_host.cpp calls RT64 directly (PDRT64_WITH_RT64, MSVC, used by the
+ * replay harness), rt64_hostdll.cpp calls rt64shim.dll (PDRT64_WITH_RT64_DLL,
+ * what the MinGW port uses), and with neither macro the calls resolve to a
+ * stub that fails at run time with a reason. That is what lets the port's
+ * build glob every .cpp under port/ without needing RT64 on its include path.
  *
  * Threading: every call is made from the thread that submits frames.
  */
@@ -26,6 +29,7 @@
 
 #include "rt64_mem.h"
 #include "rt64_registers.h"
+#include "rt64_shimabi.h"
 
 namespace pdrt64 {
 
@@ -51,18 +55,30 @@ struct HostConfig {
 
 /* Why hostInit failed, so a caller can say something better than "no". The
  * values mirror RT64's Application::SetupResult plus the cases that stop us
- * before RT64 is reached. */
+ * before RT64 is reached.
+ *
+ * The first group takes its values from rt64_shimabi.h rather than restating
+ * them, because these are exactly the codes that cross the DLL boundary and
+ * two independent lists would drift the first time one gained an entry. The
+ * second group is produced by the loader itself and never travels. */
 enum class HostResult : uint8_t {
-    Ok,
-    NotCompiledIn,          // built without PDRT64_WITH_RT64
-    AlreadyInitialised,
-    BadConfig,
-    DynamicLibrariesNotFound,
-    InvalidGraphicsApi,
-    GraphicsApiNotFound,
-    GraphicsDeviceNotFound,
-    UcodeSelectionFailed,   // RT64 accepted the device but has no GBI to run
-    Unknown,
+    Ok                       = RT64SHIM_OK,
+    NotCompiledIn            = RT64SHIM_NOT_COMPILED_IN,
+    AlreadyInitialised       = RT64SHIM_ALREADY_INITIALISED,
+    BadConfig                = RT64SHIM_BAD_CONFIG,
+    DynamicLibrariesNotFound = RT64SHIM_DYNAMIC_LIBRARIES_NOT_FOUND,
+    InvalidGraphicsApi       = RT64SHIM_INVALID_GRAPHICS_API,
+    GraphicsApiNotFound      = RT64SHIM_GRAPHICS_API_NOT_FOUND,
+    GraphicsDeviceNotFound   = RT64SHIM_GRAPHICS_DEVICE_NOT_FOUND,
+    UcodeSelectionFailed     = RT64SHIM_UCODE_SELECTION_FAILED,  // device fine, no GBI to run
+    ShimException            = RT64SHIM_EXCEPTION,
+    ShimAbiMismatch          = RT64SHIM_ABI_MISMATCH,
+    Unknown                  = RT64SHIM_UNKNOWN,
+
+    /* Loader-side only: the DLL never returns these because reaching it is
+     * what failed. */
+    ShimNotFound             = 64,
+    ShimEntryPointMissing    = 65,
 };
 
 const char *hostResultName(HostResult r);
