@@ -575,8 +575,23 @@ bool Translator::sizePendingImage(const GfxRef &ref)
         return true;
     }
 
+    /* IA16 palettes are the one case where the two renderers read the same
+     * bytes in opposite order. Both recover the big-endian entry, but fast3d
+     * then takes intensity from its low byte and alpha from its high byte
+     * (gfx_pc.cpp:820-821) where RT64 uses the documented layout, intensity
+     * high and alpha low (Formats.hlsli:109-110). PD's font palette is a
+     * constant intensity with alpha ramping 0..255; handed over as BE32 it
+     * arrives as a constant alpha with intensity ramping, which draws every
+     * glyph as an opaque block instead of anti-aliased text. Swapping each
+     * entry ahead of the BE32 placement is dst[i] = src[i^3^1] = src[i^2],
+     * which is the U16 rule exactly, so this selects an existing rule rather
+     * than adding a new one (invariant 5). RGBA16 TLUTs agree between the two
+     * (gfx_pc.cpp:828-831 against Formats.hlsli:95-106) and stay on BE32. */
+    const bool ia16Tlut = ref.kind == RefKind::Tlut &&
+                          (otherModeH_ & (3u << G_MDSFT_TEXTLUT)) == (uint32_t)G_TT_IA16;
+
     RdramAddr addr = 0;
-    if (!pushBlock(ref, Swizzle::BE32, true, &addr)) {
+    if (!pushBlock(ref, ia16Tlut ? Swizzle::U16 : Swizzle::BE32, true, &addr)) {
         return false;
     }
 
