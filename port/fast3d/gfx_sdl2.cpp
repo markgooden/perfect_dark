@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <SDL.h>
+#include <SDL_syswm.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -12,6 +13,16 @@
 static SDL_Window* wnd;
 static SDL_GLContext ctx;
 static SDL_Renderer* renderer;
+/* False when the window was created for a backend that supplies its own
+ * device (GfxWindowInitSettings::no_gl). Everything in this file that calls
+ * SDL_GL_* has to be guarded by it: those calls need a current context, and
+ * without one they fail or return garbage rather than doing nothing. */
+static bool gl_enabled = true;
+/* Only used when gl_enabled is false. SDL cannot apply a swap interval to a
+ * window it is not presenting, so the requested value is remembered here for
+ * the renderer that does present to read, and reported back unchanged so the
+ * options menu does not show a setting that silently reverted. */
+static int stored_swap_interval = 1;
 static int sdl_to_lus_table[512];
 static bool vsync_enabled = true;
 // OTRTODO: These are redundant. Info can be queried from SDL.
@@ -70,6 +81,25 @@ static void set_maximize_window(bool on) {
 	}
 }
 
+/* SDL_GL_GetDrawableSize is documented against a GL window and needs the
+ * context to report the backing-store size on HiDPI displays. Without one, ask
+ * SDL for the size in pixels directly - which is the same number, by a
+ * different route. */
+static void get_drawable_size(int *w, int *h) {
+    if (gl_enabled) {
+        SDL_GL_GetDrawableSize(wnd, w, h);
+    } else {
+#if SDL_VERSION_ATLEAST(2, 26, 0)
+        SDL_GetWindowSizeInPixels(wnd, w, h);
+#else
+        /* Pre-2.26 has no pixel-accurate query without a renderer or context,
+         * so this is the logical size: correct at 1:1, short of the drawable
+         * on a scaled display. */
+        SDL_GetWindowSize(wnd, w, h);
+#endif
+    }
+}
+
 static void gfx_sdl_get_active_window_refresh_rate(uint32_t* refresh_rate) {
     int display_in_use = SDL_GetWindowDisplayIndex(wnd);
 
@@ -81,6 +111,7 @@ static void gfx_sdl_get_active_window_refresh_rate(uint32_t* refresh_rate) {
 static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
     window_width = set->width;
     window_height = set->height;
+    gl_enabled = !set->no_gl;
 
 #ifdef SDL_HINT_VIDEO_HIGHDPI_DISABLED
     if (!set->allow_hidpi) {
@@ -97,11 +128,13 @@ static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
         sysFatalError("Could not init SDL:\n%s", SDL_GetError());
     }
 
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    if (sysArgCheck("--debug-gl")) {
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+    if (gl_enabled) {
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        if (sysArgCheck("--debug-gl")) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+        }
     }
 
     int posX = set->x;
@@ -124,7 +157,14 @@ static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
     }
 
     // we will unhide the window once the GL context is successfully created
-    Uint32 flags = SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL;
+    Uint32 flags = SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
+
+    // SDL_WINDOW_OPENGL is not merely unnecessary without a context, it is
+    // harmful: it makes SDL choose a pixel format for GL, and a window that
+    // carries one cannot then be handed to a D3D12 or Vulkan swap chain.
+    if (gl_enabled) {
+        flags |= SDL_WINDOW_OPENGL;
+    }
 
     // if fullscreen was requested, start the window in fullscreen right away
     if (set->fullscreen) {
@@ -171,7 +211,18 @@ static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
     ctx = NULL;
     u32 vmin = 0, vmaj = 0, vprof = SDL_GL_CONTEXT_PROFILE_COMPATIBILITY;
     const char *vprofstr = "";
-    for (u32 i = verstart; i < verend && !ctx; ++i) {
+    if (!gl_enabled) {
+        // One window, and no version negotiation, because there is no context
+        // to negotiate over. The backend that asked for this creates its own
+        // device against gfx_sdl_get_native_window_handle's result.
+        wnd = SDL_CreateWindow(set->title, posX, posY, window_width, window_height, flags);
+        if (!wnd) {
+            sysFatalError("Could not open SDL window:\n%s", SDL_GetError());
+        }
+        sysLogPrintf(LOG_NOTE, "SDL: created window with no GL context");
+    }
+
+    for (u32 i = verstart; gl_enabled && i < verend && !ctx; ++i) {
         vmaj = glver[i][0];
         vmin = glver[i][1];
         vprof = glver[i][2];
@@ -196,14 +247,16 @@ static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
         }
     }
 
-    if (!wnd || !ctx) {
-        sysFatalError("Could not open SDL window with an OpenGL context of any supported version:\n%s", SDL_GetError());
-    } else {
-        sysLogPrintf(LOG_NOTE, "SDL: created GL%d.%d%s context", vmaj, vmin, vprofstr);
-    }
+    if (gl_enabled) {
+        if (!wnd || !ctx) {
+            sysFatalError("Could not open SDL window with an OpenGL context of any supported version:\n%s", SDL_GetError());
+        } else {
+            sysLogPrintf(LOG_NOTE, "SDL: created GL%d.%d%s context", vmaj, vmin, vprofstr);
+        }
 
-    SDL_GL_MakeCurrent(wnd, ctx);
-    SDL_GL_SetSwapInterval(1);
+        SDL_GL_MakeCurrent(wnd, ctx);
+        SDL_GL_SetSwapInterval(1);
+    }
 
     SDL_ShowWindow(wnd);
 
@@ -284,7 +337,7 @@ static void gfx_sdl_set_dimensions(uint32_t width, uint32_t height, int32_t posX
 }
 
 static void gfx_sdl_get_dimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) {
-    SDL_GL_GetDrawableSize(wnd, static_cast<int*>((void*)width), static_cast<int*>((void*)height));
+    get_drawable_size(static_cast<int*>((void*)width), static_cast<int*>((void*)height));
     SDL_GetWindowPosition(wnd, static_cast<int*>(posX), static_cast<int*>(posY));
 }
 
@@ -300,7 +353,7 @@ static void gfx_sdl_handle_events(void) {
                 break;
             case SDL_WINDOWEVENT:
                 if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    SDL_GL_GetDrawableSize(wnd, &window_width, &window_height);
+                    get_drawable_size(&window_width, &window_height);
                     if (!fullscreen_state) {
                         maximized_state = SDL_GetWindowFlags(wnd) & SDL_WINDOW_MAXIMIZED ? true : false;
                     }
@@ -357,7 +410,12 @@ static void gfx_sdl_swap_buffers_begin(void) {
     if (target_fps) {
         sync_framerate_with_timer();
     }
-    SDL_GL_SwapWindow(wnd);
+    // Without a GL context there is nothing here to present: the backend that
+    // owns the device has already put the frame on screen by the time the
+    // frame lifecycle reaches this point.
+    if (gl_enabled) {
+        SDL_GL_SwapWindow(wnd);
+    }
 }
 
 static void gfx_sdl_swap_buffers_end(void) {
@@ -384,15 +442,76 @@ static void *gfx_sdl_get_window_handle(void) {
     return (void *)wnd;
 }
 
+/*
+ * The platform's own handle for the window, for a renderer that is not built
+ * on SDL and has to attach a swap chain itself.
+ *
+ * Only the Windows case is exercised by this project: RT64 takes an HWND
+ * (plume_render_interface_types.h:39). The others are here because the switch
+ * would otherwise silently return NULL on a platform where the handle does
+ * exist, and they are unverified against any renderer. X11 in particular
+ * hands back the Window alone, with no Display - enough for callers that
+ * open their own connection, not enough for every one.
+ */
+static void *gfx_sdl_get_native_window_handle(void) {
+    if (!wnd) {
+        return NULL;
+    }
+
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(wnd, &info)) {
+        sysLogPrintf(LOG_WARNING, "SDL: could not query native window info: %s", SDL_GetError());
+        return NULL;
+    }
+
+    switch (info.subsystem) {
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+        case SDL_SYSWM_WINDOWS:
+            return (void *)info.info.win.window;
+#endif
+#ifdef SDL_VIDEO_DRIVER_COCOA
+        case SDL_SYSWM_COCOA:
+            return (void *)info.info.cocoa.window;
+#endif
+#ifdef SDL_VIDEO_DRIVER_WAYLAND
+        case SDL_SYSWM_WAYLAND:
+            return (void *)info.info.wl.surface;
+#endif
+#ifdef SDL_VIDEO_DRIVER_X11
+        case SDL_SYSWM_X11:
+            return (void *)(uintptr_t)info.info.x11.window;
+#endif
+        default:
+            break;
+    }
+
+    sysLogPrintf(LOG_WARNING, "SDL: no native window handle for video subsystem %d",
+        (int)info.subsystem);
+    return NULL;
+}
+
 static void gfx_sdl_set_window_title(const char *title) {
     SDL_SetWindowTitle(wnd, title);
 }
 
 static int gfx_sdl_get_swap_interval(void) {
+    if (!gl_enabled) {
+        return stored_swap_interval;
+    }
     return SDL_GL_GetSwapInterval();
 }
 
 static bool gfx_sdl_set_swap_interval(int interval) {
+    if (!gl_enabled) {
+        // SDL is not presenting this window, so it has no swap interval to
+        // set. Record what was asked for: the backend that does present reads
+        // it, and reporting success keeps the options menu from showing a
+        // setting that appears to revert the moment it is changed.
+        stored_swap_interval = interval;
+        vsync_enabled = (interval != 0);
+        return true;
+    }
     const bool success = SDL_GL_SetSwapInterval(interval) >= 0;
     vsync_enabled = success && (interval != 0);
     if (!success) {
@@ -457,6 +576,7 @@ struct GfxWindowManagerAPI gfx_sdl = {
     gfx_sdl_set_target_fps,
     gfx_sdl_can_disable_vsync,
     gfx_sdl_get_window_handle,
+    gfx_sdl_get_native_window_handle,
     gfx_sdl_set_window_title,
     gfx_sdl_get_swap_interval,
     gfx_sdl_set_swap_interval,

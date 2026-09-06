@@ -118,7 +118,12 @@ s32 videoInit(void)
 			.fullscreen_is_exclusive = vidFullscreenExclusive,
 			.maximized = vidMaximize,
 			.centered = vidCenter,
-			.allow_hidpi = vidAllowHiDpi
+			.allow_hidpi = vidAllowHiDpi,
+			/* Derived from the backend chosen just above rather than from
+			 * vidRenderer again, so the two cannot disagree: any backend that
+			 * is not fast3d brings its own device and must be given a window
+			 * with no GL context on it. */
+			.no_gl = (gfx_get_backend() != &gfx_fast3d_api)
 		}
 	};
 

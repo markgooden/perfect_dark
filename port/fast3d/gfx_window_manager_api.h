@@ -15,6 +15,13 @@ struct GfxWindowInitSettings {
     bool maximized;
     bool centered;
     bool allow_hidpi;
+    /* Create the window without an OpenGL context: no SDL_WINDOW_OPENGL, no
+     * SDL_GL_CreateContext. Backends that bring their own device (RT64 creates
+     * a D3D12 or Vulkan swap chain against the bare window) need this, and a
+     * window that already carries a GL context cannot be given to one. Set
+     * from the selected backend in videoInit; false is the fast3d path and
+     * leaves window creation exactly as it was. */
+    bool no_gl;
 };
 
 struct GfxWindowManagerAPI {
@@ -46,6 +53,12 @@ struct GfxWindowManagerAPI {
     void (*set_target_fps)(int fps);
     bool (*can_disable_vsync)(void);
     void *(*get_window_handle)(void);
+    /* The platform's own handle for the same window - HWND on Windows - as
+     * opposed to get_window_handle, which returns the SDL_Window *. A renderer
+     * that is not built on SDL needs this one to attach a swap chain to.
+     * Returns NULL if the platform has no single-pointer handle, or before
+     * init. */
+    void *(*get_native_window_handle)(void);
     void (*set_window_title)(const char *);
     int (*get_swap_interval)(void);
     bool (*set_swap_interval)(int);
