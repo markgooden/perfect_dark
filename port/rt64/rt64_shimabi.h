@@ -140,6 +140,18 @@ PDRT64_SHIM_API void rt64ShimProcessDl(uint32_t dlStart, uint32_t dlEnd);
 
 PDRT64_SHIM_API void rt64ShimUpdateScreen(void);
 
+/* Texture filtering. `filterMode` carries the port's own enum FilteringMode
+ * (gfx_rendering_api.h:15) as an int32: 0 none, 1 linear, 2 three-point.
+ * `mipmapMode` and `anisotropy` are accepted and dropped - RT64 has no
+ * configuration for either. The full mapping, and why only one RT64 field is
+ * touched, is documented at the implementation in rt64_host.cpp.
+ *
+ * Adding this export needed no ABI bump by the rule above: the struct and the
+ * existing signatures are untouched, and the loader resolves each entry point
+ * by name and names the one it cannot find. */
+PDRT64_SHIM_API void rt64ShimSetTextureFiltering(int32_t filterMode, int32_t mipmapMode,
+                                                 uint32_t anisotropy);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

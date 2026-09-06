@@ -101,6 +101,20 @@ void hostProcessDl(RdramAddr dlStart, RdramAddr dlEnd);
 void hostUpdateScreen();
 
 /*
+ * Forwards the port's texture-filter choice onto RT64's live user
+ * configuration. `filterMode` carries the port's own `enum FilteringMode`
+ * values (gfx_rendering_api.h:15) as an int, because the shim ABI moves POD
+ * only: 0 none, 1 linear, 2 three-point. The exact mapping onto RT64's
+ * Filtering enum, and why `mipmapMode` and `anisotropy` are accepted and
+ * dropped, are documented at the implementation in rt64_host.cpp.
+ *
+ * Safe before hostInit: the request is remembered and applied at setup. That
+ * matters because the port sets the filter from videoInit (video.c:175), which
+ * need not run after the backend is up.
+ */
+void hostSetTextureFiltering(int filterMode, int mipmapMode, uint32_t anisotropy);
+
+/*
  * Note on render-to-RAM: docs/interfaces/rt64_host.h declared a
  * hostSetRenderToRam here, but RT64 has no API for it - it is an extended GBI
  * command carried in the stream (rt64_gbi_extended.cpp:183-186). It lives on

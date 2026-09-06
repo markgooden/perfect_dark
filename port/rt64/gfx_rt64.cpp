@@ -608,14 +608,22 @@ void rt64SetTargetFps(int fps)
 }
 
 /*
- * Texture filtering is not wired to RT64 yet: hostSetTextureFiltering is
- * declared in the interface header but has no implementation and no export on
- * the shim (docs/TASKLOG.md). RT64 applies its own enhancement configuration
- * meanwhile, so these are accepted and dropped rather than refused - refusing
- * would make the options menu unusable on this path for a setting that is
- * cosmetic here.
+ * Texture filtering. Only the filter mode reaches RT64; mipmap mode and
+ * anisotropy have nowhere to go, because RT64's UserConfiguration has no field
+ * for either. They are accepted and dropped rather than refused - refusing
+ * would make the options menu unusable on this path - and
+ * rt64GetMaxAnisotropyLevel reports 1, which tells the menu the same thing.
+ *
+ * The filter value is the port's own enum, passed through unchanged; the
+ * mapping onto RT64 is documented at rt64_host.cpp's hostSetTextureFiltering,
+ * and is narrower than it looks - RT64's Filtering enum is presentation
+ * scaling, not texture sampling.
  */
-void rt64SetTextureFilter(enum FilteringMode mode) { (void)mode; }
+void rt64SetTextureFilter(enum FilteringMode mode)
+{
+    hostSetTextureFiltering((int)mode, 0, 0);
+}
+
 void rt64SetMipmapFilter(enum MipmapFilteringMode mode) { (void)mode; }
 int rt64GetMaxAnisotropyLevel(void) { return 1; }
 void rt64SetAnisotropyLevel(int level) { (void)level; }

@@ -56,6 +56,54 @@ namespace pdrt64 {
 namespace {
 
 /*
+ * Texture filtering, port value -> RT64 configuration.
+ *
+ * rt64_host.h leaves the mapping to the implementation, so it is spelled out
+ * here. The wire values are the port's own `enum FilteringMode`
+ * (gfx_rendering_api.h:15), passed as int because the shim ABI carries POD
+ * only: 0 FILTER_NONE, 1 FILTER_LINEAR, 2 FILTER_THREE_POINT.
+ *
+ * **Only `threePointFiltering` is touched.** The obvious-looking mapping - onto
+ * `UserConfiguration::filtering`, which even has Nearest and Linear members -
+ * is wrong, and measurably so. That enum is consumed in exactly one place,
+ * `rt64_vi_renderer.cpp:48-56`: it is the filter the VI renderer uses when
+ * scaling the finished image to the output, not how texels are sampled. Set it
+ * and nothing about texture sampling changes; the first version of this
+ * function did, and nearest, linear and RT64's own default all rendered
+ * byte-identical through dlreplay, which renders to RAM at native resolution
+ * where the VI scaler never runs.
+ *
+ * Texture sampling is `threePointFiltering`, read at `rt64_state.cpp:823` as
+ * `const bool linearFiltering = !ext.userConfig->threePointFiltering`. So:
+ *
+ *   FILTER_THREE_POINT -> threePointFiltering = true   (the RDP's own filter)
+ *   FILTER_LINEAR      -> threePointFiltering = false  (bilinear)
+ *   FILTER_NONE        -> threePointFiltering = false, and see below
+ *
+ * FILTER_NONE cannot be honoured. RT64 has no "sample textures nearest"
+ * switch: point sampling is what the display list asks for through
+ * G_MDSFT_TEXTFILT, which already reaches RT64 in the stream, so the renderer
+ * follows the game rather than a global override. Mapping it to linear is
+ * therefore the closest honest answer - it leaves the per-draw G_TF_POINT
+ * intact and only declines the global forcing that RT64 does not implement.
+ *
+ * `userConfig.filtering` is deliberately left alone. It is presentation
+ * scaling, the port does not expose a setting for it through this call, and
+ * overriding it here would silently change how the frame is scaled to the
+ * window on the strength of a texture-filter menu item.
+ *
+ * `mipmapMode` and `anisotropy` are accepted and dropped. RT64's
+ * UserConfiguration has no mipmap-filter field and no anisotropy field at all,
+ * so there is nothing to forward them to; the backend already reports
+ * rt64GetMaxAnisotropyLevel() == 1, which says the same thing to the options
+ * menu. They stay in the signature because removing them would be an ABI
+ * change for no gain if RT64 ever grows the settings.
+ */
+constexpr int kFilterNone = 0;
+constexpr int kFilterLinear = 1;
+constexpr int kFilterThreePoint = 2;
+
+/*
  * The live host. RT64's Application keeps the pointers it is given rather than
  * copying them, so the register block and the RDRAM buffer have to outlive it.
  * Those belong to the caller; this file stores only the Core that points at
@@ -65,6 +113,14 @@ struct Host {
     std::unique_ptr<RT64::Application> app;
     RT64::Application::Core core = {};
     Registers *regs = nullptr;
+
+    /* The port sets the texture filter from videoInit (video.c:175), which can
+     * run before the backend is up, so the request is remembered and applied
+     * again once Application exists. Default matches the port's own default,
+     * texFilter = FILTER_LINEAR (video.c:59), so that a build which never
+     * calls the setter still agrees with the reference path rather than
+     * silently keeping RT64's defaults. */
+    int filterMode = kFilterLinear;
 };
 
 Host g_host;
@@ -86,6 +142,23 @@ HostResult fromSetupResult(RT64::Application::SetupResult r)
     case S::GraphicsDeviceNotFound:    return HostResult::GraphicsDeviceNotFound;
     default:                           return HostResult::Unknown;
     }
+}
+
+/* Pushes g_host.filterMode into RT64's live configuration. Safe to call with
+ * no Application: the value is kept and applied by hostInit. */
+void applyFiltering()
+{
+    if (!g_host.app) {
+        return;
+    }
+
+    g_host.app->userConfig.threePointFiltering =
+        (g_host.filterMode == kFilterThreePoint);
+
+    /* discardFBs=false: filtering changes how existing targets are sampled,
+     * not their size or format, so throwing the framebuffers away would cost a
+     * visible reallocation for nothing. */
+    g_host.app->updateUserConfig(false);
 }
 
 /* Wires the register block into Core. Application::Core::decodeVI reads
@@ -211,6 +284,11 @@ HostResult hostInit(const HostConfig &cfg)
         g_host.app.reset();
         return HostResult::UcodeSelectionFailed;
     }
+
+    /* Whatever the port asked for before the backend existed. Without this,
+     * RT64 keeps threePointFiltering on (rt64_user_configuration.cpp:79) while
+     * the port believes it selected FILTER_LINEAR (video.c:59). */
+    applyFiltering();
     return HostResult::Ok;
 }
 
@@ -227,6 +305,17 @@ void hostShutdown()
 bool hostReady()
 {
     return g_host.app != nullptr;
+}
+
+void hostSetTextureFiltering(int filterMode, int mipmapMode, uint32_t anisotropy)
+{
+    (void)mipmapMode;
+    (void)anisotropy;
+    if (filterMode < kFilterNone || filterMode > kFilterThreePoint) {
+        filterMode = kFilterLinear;
+    }
+    g_host.filterMode = filterMode;
+    applyFiltering();
 }
 
 void hostProcessDl(RdramAddr dlStart, RdramAddr dlEnd)

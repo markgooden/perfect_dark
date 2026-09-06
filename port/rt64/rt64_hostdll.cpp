@@ -71,6 +71,7 @@ using ShutdownFn = void (*)(void);
 using ReadyFn = int32_t (*)(void);
 using ProcessDlFn = void (*)(uint32_t, uint32_t);
 using UpdateScreenFn = void (*)(void);
+using SetTextureFilteringFn = void (*)(int32_t, int32_t, uint32_t);
 
 struct Shim {
     HMODULE module = nullptr;
@@ -80,6 +81,14 @@ struct Shim {
     ReadyFn ready = nullptr;
     ProcessDlFn processDl = nullptr;
     UpdateScreenFn updateScreen = nullptr;
+    SetTextureFilteringFn setTextureFiltering = nullptr;
+
+    /* The port sets the texture filter from videoInit (video.c:175), which can
+     * run before the DLL is up. Remembered here and replayed after init, so
+     * the two builds - this one and the direct one in rt64_host.cpp - behave
+     * the same way for a caller that sets it early. Default 1 is the port's
+     * own FILTER_LINEAR (video.c:59). */
+    int32_t filterMode = 1;
     bool live = false;      // init succeeded and shutdown has not run
 };
 
@@ -181,7 +190,8 @@ HostResult openShim()
         !resolve(module, "rt64ShimShutdown", &s.shutdown) ||
         !resolve(module, "rt64ShimReady", &s.ready) ||
         !resolve(module, "rt64ShimProcessDl", &s.processDl) ||
-        !resolve(module, "rt64ShimUpdateScreen", &s.updateScreen)) {
+        !resolve(module, "rt64ShimUpdateScreen", &s.updateScreen) ||
+        !resolve(module, "rt64ShimSetTextureFiltering", &s.setTextureFiltering)) {
         FreeLibrary(module);
         return HostResult::ShimEntryPointMissing;
     }
@@ -233,6 +243,12 @@ HostResult hostInit(const HostConfig &cfg)
 
     const HostResult r = HostResult(uint8_t(g_shim.init(&c)));
     g_shim.live = (r == HostResult::Ok);
+    if (g_shim.live) {
+        /* Replay whatever was asked for before the DLL existed. Without it
+         * RT64 keeps three-point filtering on while the port believes it
+         * selected linear. */
+        g_shim.setTextureFiltering(g_shim.filterMode, 0, 0);
+    }
     return r;
 }
 
@@ -273,6 +289,15 @@ void hostUpdateScreen()
         return;
     }
     g_shim.updateScreen();
+}
+
+void hostSetTextureFiltering(int filterMode, int mipmapMode, uint32_t anisotropy)
+{
+    g_shim.filterMode = int32_t(filterMode);
+    if (!g_shim.live) {
+        return;
+    }
+    g_shim.setTextureFiltering(int32_t(filterMode), int32_t(mipmapMode), anisotropy);
 }
 
 } // namespace pdrt64
