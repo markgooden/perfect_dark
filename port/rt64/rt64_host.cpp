@@ -289,6 +289,22 @@ HostResult hostInit(const HostConfig &cfg)
      * RT64 keeps threePointFiltering on (rt64_user_configuration.cpp:79) while
      * the port believes it selected FILTER_LINEAR (video.c:59). */
     applyFiltering();
+
+    /*
+     * Report what RT64's own device says about raytracing, rather than what
+     * the GPU's model number implies. RT-PLAN's RT0 asks for the dev GPU's DXR
+     * support to be confirmed, and the capability RT64 will actually consult
+     * is this one - it is what gates the acceleration-structure buffer flags
+     * that already exist in the raster path (rt64_workload.cpp:197,241) and
+     * what any future RT work would build on. One line at init, because the
+     * answer is a property of the machine and belongs in every run's log.
+     */
+    if (g_host.app->device) {
+        const auto &caps = g_host.app->device->getCapabilities();
+        printf("rt64: device raytracing=%d raytracingStateUpdate=%d\n",
+               (int)caps.raytracing, (int)caps.raytracingStateUpdate);
+        fflush(stdout);
+    }
     return HostResult::Ok;
 }
 
