@@ -690,6 +690,7 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
 
         const GfxRef ref = gfxStep(st_, &g[0]);
         ++stats_.commandsIn;
+        ++stats_.seenPerOpcode[opcode];
 
         const Disposition how = dispositionOf(opcode);
         if (how != Disposition::Translated) {

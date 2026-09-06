@@ -40,6 +40,10 @@ extern "C" {
 #include "config.h"
 #include "../fast3d/gfx_graphics_api.h"
 #include "rt64_capture.h"
+/* The port's private opcodes, for the survey's watchlist. Safe here for the
+ * same reason it is safe in rt64_capture.cpp: this file includes the port's
+ * gbi.h and never RT64's, and the two must not meet in one translation unit. */
+#include "gbiex.h"
 }
 
 /* The port globals the live reader spans. Declared rather than included: the
@@ -108,6 +112,12 @@ struct Backend {
     uint32_t framebuffersCreated = 0;
     uint64_t droppedPerOpcode[256] = {};
 
+    /* --rt64-survey: what the walkthrough saw (SCAFFOLD T13). */
+    const char *surveyPrefix = nullptr;
+    uint64_t seenPerOpcode[256] = {};
+    uint64_t firstFrameSeen[256] = {};
+    bool capturedOpcode[256] = {};
+
     /* Per-frame CSV for the perf gate (SCAFFOLD T12, risk R1). Written from
      * here rather than derived from the log because the numbers that decide
      * the gate - translate time against wall-clock frame time - only exist
@@ -163,6 +173,134 @@ void syncNativeMode()
      * through a rectangle sized for the previous mode. */
     g_be.fbs->setNativeSize(w, h);
     sysLogPrintf(LOG_NOTE, "rt64: native mode %ux%u", w, h);
+}
+
+/*
+ * The opcodes a walkthrough exists to find (SCAFFOLD T13).
+ *
+ * These are the port's private dialect - the thirteen commands that exist on
+ * neither N64 nor RT64 (SCAFFOLD C1). Most appear constantly; a handful appear
+ * only when a specific effect runs, and those are the ones a survey cannot get
+ * any other way. T8 established which: SETFB and IMAGERECT come from one block
+ * that runs exactly once, on the frame the pause menu opens (menugfx.c:154-165,
+ * guarded by g_MenuBlurDone), and COPYFB with RDPFLUSH need the CamSpy or the
+ * Horizon Scanner in hand (bondview.c, via player.c:4887,4909).
+ *
+ * Capturing on first sighting is what makes the session cheap: nobody has to
+ * press a key on the right frame, which for a once-per-menu-open command is not
+ * a reasonable thing to ask.
+ */
+const uint8_t kSurveyOpcodes[] = {
+    G_SETFB_EXT, G_SETTIMG_FB_EXT, G_INVALTEXCACHE_EXT, G_TEXRECT_WIDE_EXT,
+    G_FILLRECT_WIDE_EXT, G_SETGRAYSCALE_EXT, G_EXTRAGEOMETRYMODE_EXT,
+    G_SETINTENSITY_EXT, G_COPYFB_EXT, G_IMAGERECT_EXT, G_RDPFLUSH_EXT,
+    G_CLEAR_DEPTH_EXT, G_SETSUBPIXELOFFSET_EXT,
+};
+
+bool isSurveyOpcode(uint8_t op)
+{
+    for (size_t i = 0; i < sizeof(kSurveyOpcodes); ++i) {
+        if (kSurveyOpcodes[i] == op) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Rewritten in full whenever it changes rather than appended to.
+ *
+ * A survey run ends however the player ends it, and closing the window calls
+ * exit() straight from the SDL event loop (gfx_sdl2.cpp) without unwinding
+ * through rt64Destroy. A file written only at shutdown would therefore be
+ * empty after the one kind of run this mode is for. It is at most 256 rows.
+ */
+void writeSurvey()
+{
+    if (!g_be.surveyPrefix) {
+        return;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s-opcodes.csv", g_be.surveyPrefix);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "opcode,name,seen,dropped,firstFrame,captured\n");
+    for (int i = 0; i < 256; ++i) {
+        if (!g_be.seenPerOpcode[i] && !g_be.droppedPerOpcode[i]) {
+            continue;
+        }
+        const char *name = gfxOpcodeName((uint8_t)i);
+        fprintf(f, "0x%02x,%s,%llu,%llu,%llu,%d\n", i, name ? name : "?",
+            (unsigned long long)g_be.seenPerOpcode[i],
+            (unsigned long long)g_be.droppedPerOpcode[i],
+            (unsigned long long)g_be.firstFrameSeen[i],
+            g_be.capturedOpcode[i] ? 1 : 0);
+    }
+    fclose(f);
+}
+
+/* Called once per frame with the frame's per-opcode counts. Notices anything
+ * seen for the first time, and captures the watchlisted ones. */
+void surveyFrame(const TranslateStats &fs)
+{
+    bool changed = false;
+    for (int i = 0; i < 256; ++i) {
+        if (!fs.seenPerOpcode[i]) {
+            continue;
+        }
+        if (!g_be.seenPerOpcode[i]) {
+            changed = true;
+            g_be.firstFrameSeen[i] = g_be.frameCount;
+            const char *name = gfxOpcodeName((uint8_t)i);
+            sysLogPrintf(LOG_NOTE, "survey: first sighting of 0x%02x %s at frame %llu",
+                i, name ? name : "?", (unsigned long long)g_be.frameCount);
+        }
+        g_be.seenPerOpcode[i] += fs.seenPerOpcode[i];
+    }
+
+    /*
+     * Arm at most one capture per frame, for a watchlisted opcode that is in
+     * THIS frame and has not been captured yet.
+     *
+     * Not on first sighting alone: most of the dialect turns up in the first
+     * two frames of a level, all at once, and only one capture can be in
+     * flight - so a first-sighting-only rule captures whichever came first and
+     * silently never captures the rest. Retrying on any later occurrence gets
+     * all of the recurring ones eventually, in the order they recur.
+     *
+     * What this cannot get is a command that fires on exactly one frame ever:
+     * arming happens at end-of-frame, so the capture starts on the frame after
+     * the sighting. G_SETFB_EXT and G_IMAGERECT_EXT's pause-blur block is
+     * exactly that (menugfx.c:154-165, once per menu open). For those the
+     * answer is the F9 hotkey, armed before opening the menu - see
+     * docs/T13-SESSION.md.
+     */
+    if (!pdCaptureActive()) {
+        for (size_t k = 0; k < sizeof(kSurveyOpcodes); ++k) {
+            const uint8_t op = kSurveyOpcodes[k];
+            if (!fs.seenPerOpcode[op] || g_be.capturedOpcode[op]) {
+                continue;
+            }
+            const char *name = gfxOpcodeName(op);
+            if (!name) {
+                continue;
+            }
+            char prefix[512];
+            snprintf(prefix, sizeof(prefix), "%s-%s", g_be.surveyPrefix, name);
+            pdCaptureArm(prefix, 2);
+            g_be.capturedOpcode[op] = true;
+            changed = true;
+            break;
+        }
+    }
+
+    /* Periodically as well as on change, so the counts in the file are current
+     * whenever the player stops. */
+    if (changed || (g_be.frameCount % 600) == 0) {
+        writeSurvey();
+    }
 }
 
 void rt64Init(const struct GfxInitSettings *settings)
@@ -230,6 +368,20 @@ void rt64Init(const struct GfxInitSettings *settings)
     const s32 validateCfg = (validateArg >= 0) ? validateArg : g_validate;
     const bool validate = (validateCfg < 0) ? validationDefault() : (validateCfg != 0);
     g_be.tr->setValidationEnabled(validate);
+
+    g_be.surveyPrefix = sysArgGetString("--rt64-survey");
+    if (g_be.surveyPrefix && !*g_be.surveyPrefix) {
+        g_be.surveyPrefix = nullptr;
+    }
+    if (g_be.surveyPrefix) {
+        /* Capture has to be able to record, and on this path that means the
+         * translator's hook - fast3d never runs (T10). start_frame installs it
+         * from pdCaptureCommandHook every frame, so nothing more is needed
+         * here than saying so. */
+        sysLogPrintf(LOG_NOTE, "survey: recording opcode coverage to %s-opcodes.csv, "
+            "capturing 2 frames on first sighting of each EXT opcode",
+            g_be.surveyPrefix);
+    }
 
     const char *statsPath = sysArgGetString("--rt64-stats");
     if (statsPath && *statsPath) {
@@ -312,6 +464,7 @@ void rt64Destroy(void)
     }
     /* The host goes first: RT64 holds the arena and the register block, and
      * must stop reading them before they are freed. */
+    writeSurvey();
     if (g_be.statsCsv) {
         fclose(g_be.statsCsv);
         g_be.statsCsv = nullptr;
@@ -417,6 +570,9 @@ void rt64EndFrame(void)
     g_be.totalBlits += fs.framebufferBlits;
     for (int i = 0; i < 256; ++i) {
         g_be.droppedPerOpcode[i] += fs.droppedPerOpcode[i];
+    }
+    if (g_be.surveyPrefix) {
+        surveyFrame(fs);
     }
 
     if (g_be.statsCsv) {

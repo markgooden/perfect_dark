@@ -121,6 +121,13 @@ struct TranslateStats {
     uint32_t droppedCommands = 0;   // not handled at this task's scope
     uint32_t droppedPerOpcode[256] = {};  // counts whole commands, nothing else
 
+    /* Every command by opcode, whatever became of it. droppedPerOpcode says
+     * what was refused; this says what the game actually emitted, which is the
+     * other half of the question T13 has to answer - an effect that never
+     * appears in a playthrough is a different problem from one that appears and
+     * is dropped, and the two are indistinguishable without this. */
+    uint32_t seenPerOpcode[256] = {};
+
     /* G_EXTRAGEOMETRYMODE_EXT commands that were acted on but carried flags
      * beyond invert-culling, which v1 drops (SCAFFOLD 3.4). Kept separate:
      * folding it into droppedPerOpcode would make one entry of that array mean

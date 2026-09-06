@@ -122,6 +122,11 @@ struct CaptureState {
     bool hotkeyWasDown = false;
     int hotkeyFrames = 0;
     std::string hotkeyPrefix;
+    /* Successive presses get their own prefix. Reusing one overwrites the
+     * previous capture silently, which cost the census a set of frames
+     * (docs/TASKLOG.md, T3) and would cost a survey session more, since the
+     * whole point of pressing F9 twice is to catch two different moments. */
+    int hotkeyShot = 0;
 
     /* Golden image for this frame, if the backend supplied one. */
     std::vector<uint8_t> goldenRgb;
@@ -599,7 +604,7 @@ extern "C" void pdCaptureSetupHotkey(const char *pathPrefix, int frames)
     g_cap.hotkeyPrefix = pathPrefix;
     g_cap.hotkeyFrames = frames;
     pdrt64::regionsInit();
-    sysLogPrintf(LOG_NOTE, "capture: press F9 to capture %d frames to '%s'",
+    sysLogPrintf(LOG_NOTE, "capture: press F9 to capture %d frames to '%s-NN'",
                  frames, pathPrefix);
 }
 
@@ -672,7 +677,10 @@ static void pdCapturePollHotkey(void)
 
     const bool down = keys[SDL_SCANCODE_F9] != 0;
     if (down && !g_cap.hotkeyWasDown) {
-        pdCaptureArm(g_cap.hotkeyPrefix.c_str(), g_cap.hotkeyFrames);
+        char prefix[512];
+        snprintf(prefix, sizeof(prefix), "%s-%02d", g_cap.hotkeyPrefix.c_str(),
+                 g_cap.hotkeyShot++);
+        pdCaptureArm(prefix, g_cap.hotkeyFrames);
     }
     g_cap.hotkeyWasDown = down;
 }
