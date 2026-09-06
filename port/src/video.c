@@ -77,6 +77,14 @@ static s32 fpsNumFrames = 0;
  * forever, which is every normal launch. */
 static s32 vidFrameLimit = 0;
 
+/* --frame-stats <path>: one row per frame of wall-clock frame time, for
+ * whichever backend is selected. It lives here rather than in a backend
+ * because the question it answers is a comparison between them - RT64's
+ * per-frame cost only means something next to what the OpenGL path does with
+ * the same scene, and a counter only one backend keeps cannot answer that.
+ * The RT64 translator's own per-frame numbers stay on --rt64-stats. */
+static FILE *vidFrameStats = NULL;
+
 static s32 videoInitDisplayModes(void);
 void optionsMenuInit();
 
@@ -86,6 +94,19 @@ s32 videoInit(void)
 	renderingAPI = &gfx_opengl_api;
 
 	vidFrameLimit = sysArgGetInt("--frames", 0);
+
+	{
+		const char *statsPath = sysArgGetString("--frame-stats");
+		if (statsPath && statsPath[0]) {
+			vidFrameStats = fopen(statsPath, "w");
+			if (vidFrameStats) {
+				fprintf(vidFrameStats, "frame,frameMs\n");
+				sysLogPrintf(LOG_NOTE, "video: writing frame times to %s", statsPath);
+			} else {
+				sysLogPrintf(LOG_WARNING, "video: could not open %s for frame times", statsPath);
+			}
+		}
+	}
 
 	/* Pick the graphics backend before anything touches gfx_*. --renderer wins
 	 * over the config value; anything unrecognised falls back to fast3d.
@@ -196,13 +217,22 @@ void videoEndFrame(void)
 		 * with a live device: on the RT64 path the arena and the register
 		 * block are borrowed by code across a DLL boundary that has to stop
 		 * reading them first. */
-		sysLogPrintf(LOG_NOTE, "video: --frames %d reached, exiting", (int)vidFrameLimit);
+			sysLogPrintf(LOG_NOTE, "video: --frames %d reached, exiting", (int)vidFrameLimit);
+		if (vidFrameStats) {
+			fclose(vidFrameStats);
+			vidFrameStats = NULL;
+		}
 		gfx_destroy();
 		exit(0);
 	}
 
 	const f64 flipTime = wmAPI->get_time();
 	accumDelta += flipTime - endTime;
+
+	if (vidFrameStats && endTime > 0.0) {
+		fprintf(vidFrameStats, "%u,%.4f\n", frames, (flipTime - endTime) * 1000.0);
+	}
+
 	endTime = flipTime;
 
 	if (endTime >= fpsTime) {

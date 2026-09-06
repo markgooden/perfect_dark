@@ -106,6 +106,14 @@ struct Backend {
      * about whether either was exercised. */
     uint64_t totalBlits = 0;
     uint32_t framebuffersCreated = 0;
+    uint64_t droppedPerOpcode[256] = {};
+
+    /* Per-frame CSV for the perf gate (SCAFFOLD T12, risk R1). Written from
+     * here rather than derived from the log because the numbers that decide
+     * the gate - translate time against wall-clock frame time - only exist
+     * together at this point in the frame. */
+    FILE *statsCsv = nullptr;
+    double lastFrameTime = 0.0;
 
     /* One line per distinct translation failure, not one per frame. A backend
      * that has started failing every list would otherwise fill the log faster
@@ -223,6 +231,19 @@ void rt64Init(const struct GfxInitSettings *settings)
     const bool validate = (validateCfg < 0) ? validationDefault() : (validateCfg != 0);
     g_be.tr->setValidationEnabled(validate);
 
+    const char *statsPath = sysArgGetString("--rt64-stats");
+    if (statsPath && *statsPath) {
+        g_be.statsCsv = fopen(statsPath, "w");
+        if (g_be.statsCsv) {
+            fprintf(g_be.statsCsv,
+                "frame,commandsIn,commandsOut,dropped,trianglesIn,marshalledBytes,"
+                "texBlocks,texHits,texMisses,blits,translateMs,frameMs\n");
+            sysLogPrintf(LOG_NOTE, "rt64: writing per-frame stats to %s", statsPath);
+        } else {
+            sysLogPrintf(LOG_WARNING, "rt64: could not open %s for stats", statsPath);
+        }
+    }
+
     g_be.hashFrames = sysArgCheck("--rt64-hash") != 0;
     g_be.tr->setRenderToRam(g_be.hashFrames);
 
@@ -268,8 +289,33 @@ void rt64Destroy(void)
     sysLogPrintf(LOG_NOTE, "rt64: %llu frames, %u framebuffers created, %llu blits",
         (unsigned long long)g_be.frameCount, g_be.framebuffersCreated,
         (unsigned long long)g_be.totalBlits);
+
+    /* Which opcodes were dropped, over the whole run. Per-frame counters reset
+     * every frame and the CSV records only the total, so without this a run
+     * that dropped tens of thousands of commands cannot say what they were -
+     * which is precisely the list T13 has to account for. */
+    uint64_t droppedTotal = 0;
+    for (int i = 0; i < 256; ++i) {
+        droppedTotal += g_be.droppedPerOpcode[i];
+    }
+    if (droppedTotal) {
+        sysLogPrintf(LOG_NOTE, "rt64: %llu commands dropped across the run:",
+            (unsigned long long)droppedTotal);
+        for (int i = 0; i < 256; ++i) {
+            if (!g_be.droppedPerOpcode[i]) {
+                continue;
+            }
+            const char *name = gfxOpcodeName((uint8_t)i);
+            sysLogPrintf(LOG_NOTE, "rt64:   0x%02x %-24s %llu", i, name ? name : "?",
+                (unsigned long long)g_be.droppedPerOpcode[i]);
+        }
+    }
     /* The host goes first: RT64 holds the arena and the register block, and
      * must stop reading them before they are freed. */
+    if (g_be.statsCsv) {
+        fclose(g_be.statsCsv);
+        g_be.statsCsv = nullptr;
+    }
     hostShutdown();
     g_be.tr.reset();
     g_be.mem.reset();
@@ -367,7 +413,27 @@ void rt64EndFrame(void)
             (unsigned long long)hash, st.commandsIn, st.commandsOut, st.droppedCommands);
     }
 
-    g_be.totalBlits += g_be.tr->stats().framebufferBlits;
+    const TranslateStats &fs = g_be.tr->stats();
+    g_be.totalBlits += fs.framebufferBlits;
+    for (int i = 0; i < 256; ++i) {
+        g_be.droppedPerOpcode[i] += fs.droppedPerOpcode[i];
+    }
+
+    if (g_be.statsCsv) {
+        /* Wall-clock frame time, measured across the same boundary the port's
+         * own frame loop uses, so it includes RT64's present and any wait the
+         * framerate limiter imposed. Comparing translateMs against it is the
+         * whole point: a translator inside budget on a frame that took 30 ms
+         * has not proved anything. */
+        const double now = g_be.wapi->get_time();
+        const double frameMs = g_be.lastFrameTime > 0.0 ? (now - g_be.lastFrameTime) * 1000.0 : 0.0;
+        g_be.lastFrameTime = now;
+        fprintf(g_be.statsCsv, "%llu,%u,%u,%u,%u,%llu,%u,%u,%u,%u,%.4f,%.4f\n",
+            (unsigned long long)g_be.frameCount, fs.commandsIn, fs.commandsOut,
+            fs.droppedCommands, fs.trianglesIn, (unsigned long long)fs.marshalledBytes,
+            fs.textureBlocks, fs.textureCacheHits, fs.textureCacheMisses,
+            fs.framebufferBlits, fs.translateMs, frameMs);
+    }
     g_be.parity ^= 1;
     ++g_be.frameCount;
 
