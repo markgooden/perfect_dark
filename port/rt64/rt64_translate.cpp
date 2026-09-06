@@ -323,6 +323,104 @@ void Translator::emitDepthClear()
          otherModeH_ & (3u << 20));
 }
 
+/*
+ * The load-tile dxt PD never supplies.
+ *
+ * RT64 emulates the N64's odd-row interleave faithfully: its texture fetch
+ * swaps the two 32-bit words of every odd texel row
+ * (src/shaders/TextureDecoder.hlsli:17-25), and its TMEM load applies the
+ * matching swap only as `dxt` accumulates past DXTSwap
+ * (rt64_rdp.cpp:426-435). The port emits dxt=0 on every G_LOADBLOCK, so the
+ * load never interleaves while the fetch un-interleaves regardless, and every
+ * odd row of every texture comes back with its words transposed - horizontal
+ * smearing that leaves the row's average colour intact, which is why it reads
+ * as "textures look a bit off" and as solid blocks wherever the texture is a
+ * font glyph.
+ *
+ * fast3d never needed dxt because it does not emulate TMEM at all: it keeps
+ * the block by address and decodes it at draw time using the render tile
+ * (gfx_pc.cpp:1893-1917 - note the tile == G_TX_LOADTILE assertion is
+ * commented out, which is why nothing on that side ever minded that the port
+ * does not maintain a load tile either).
+ *
+ * So the value has to be reconstructed here. dxt is the reciprocal of the
+ * texture's row length in 64-bit words, in 1.11 fixed point, and `line` on a
+ * tile descriptor is exactly that row length - in words, independent of the
+ * texel format, which is what lets a 16-bit load feed a 4- or 8-bit tile.
+ *
+ * The row length belongs to the tile that describes the top of what was
+ * loaded, and the way to find it is tmem: a mipmapped load emits three tiles
+ * from one G_LOADBLOCK (0, 1 and 2 with descending line) and only the first
+ * starts where the load landed. Matching on tmem picks that one; matching on
+ * "the next tile 0" happens to agree most of the time and is not the same
+ * rule.
+ */
+/*
+ * The load-tile dxt the port never supplies.
+ *
+ * RT64 emulates the N64's odd-row interleave: its texture fetch swaps the two
+ * 32-bit words of every odd texel row (src/shaders/TextureDecoder.hlsli:17-25)
+ * and its TMEM load applies the matching swap only as `dxt` accumulates past
+ * DXTSwap (rt64_rdp.cpp:426-435). The port emits dxt=0 on every G_LOADBLOCK,
+ * so the load never interleaves while the fetch un-interleaves regardless, and
+ * every odd row of every texture comes back with its two 32-bit words
+ * transposed - horizontal smearing that preserves each row's average colour.
+ * It reads as "textures look a bit off", and as solid blocks wherever the
+ * texture is a font glyph.
+ *
+ * fast3d never needed dxt because it does not emulate TMEM at all: it keeps
+ * the block by address and decodes it at draw time from the render tile
+ * (gfx_pc.cpp:1893-1917 - its tile == G_TX_LOADTILE assertion is commented
+ * out, which is why nothing on that side minded that the port maintains no
+ * load tile either).
+ *
+ * dxt is the reciprocal of the row length in 64-bit words, in 1.11 fixed
+ * point, and a tile's `line` is exactly that row length - in words, whatever
+ * the texel format, which is what lets one 16-bit load feed a 4- or 8-bit
+ * tile.
+ *
+ * It has to come from the descriptor that FOLLOWS the load. Using whichever
+ * tile happened to be in effect covers more loads - the port sets a tile once
+ * and streams textures in behind it, so most loads have no descriptor after
+ * them - but it answers them with the previous texture's row length, and
+ * measurably renders worse than leaving dxt alone. Coverage is not the goal;
+ * a wrong dxt is worse than none.
+ */
+bool Translator::supplyDxtFromTile(uint32_t tileW0, uint32_t tileW1)
+{
+    const uint32_t tile = (tileW1 >> 24) & 7;
+    const uint32_t line = (tileW0 >> 9) & 0x1ff;
+    if (!pendingLoad_.valid || !line || tile != kRenderTile) {
+        return true;
+    }
+
+    /* CALC_DXT rounds up (gbi.h:2612). Flooring drifts the swap point across
+     * rows and only half-corrects. */
+    const uint32_t dxt = (0x800u + line - 1u) / line;
+    const uint32_t patched = (pendingLoad_.w1 & ~0xfffu) | (dxt & 0xfff);
+    out_[pendingLoad_.pairIndex + 1] = patched;
+    pendingLoad_.valid = false;
+    --stats_.loadsWithoutDxt;
+    ++stats_.loadsGivenDxt;
+
+    /*
+     * Re-check the command we just rewrote. It passed validation when it was
+     * emitted, so leaving it would mean a command reaching RT64 that the round
+     * trip never saw - evading invariant 6 rather than satisfying it. The
+     * expectation is built from the original word and the computed dxt, not
+     * read back out of the buffer, so it is still an independent check.
+     */
+    if (!validate_) {
+        return true;
+    }
+    DecodedCmd expect;
+    expect.opcode = (uint8_t)G_LOADBLOCK;
+    expect.fields[0] = pendingLoad_.w0 & 0x00ffffff;
+    expect.fields[1] = patched;
+    expect.fieldCount = 2;
+    return validateEmitted(pendingLoad_.pairIndex, expect);
+}
+
 void Translator::emitImageBlit(RdramAddr srcAddr, uint32_t sw, uint32_t sh,
                               RdramAddr dstAddr, uint32_t dw, uint32_t dh,
                               uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry,
@@ -1005,6 +1103,15 @@ TranslateStatus Translator::walk(uintptr_t at, int depth)
                 otherModeH_ = w0 & 0x00ffffff;
             }
             emit(w0, w1);
+            if (opcode == (uint8_t)G_LOADBLOCK) {
+                pendingLoad_.pairIndex = out_.size() - 2;
+                pendingLoad_.w0 = w0;
+                pendingLoad_.w1 = w1;
+                pendingLoad_.valid = true;
+                ++stats_.loadsWithoutDxt;
+            } else if (opcode == (uint8_t)G_SETTILE && !supplyDxtFromTile(w0, w1)) {
+                return TranslateStatus::ValidationFailed;
+            }
             expect.opcode = opcode;
             expect.fields[0] = w0 & 0x00ffffff;
             expect.fields[1] = w1;
@@ -1308,6 +1415,7 @@ TranslateStatus Translator::translate(uintptr_t rootDl, RdramAddr *outStart,
 
     out_.clear();
     error_.clear();
+    pendingLoad_ = PendingLoad{};
     emitStreamPrefix();
 
     /* Copies requested outside the display list happen between frames -

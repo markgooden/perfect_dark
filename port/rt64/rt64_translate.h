@@ -148,6 +148,13 @@ struct TranslateStats {
      * nonzero count means the deferred-sizing assumption needs revisiting. */
     uint32_t unsizedImages = 0;
 
+    /* G_LOADBLOCK commands that were given a reconstructed dxt, and those no
+     * tile descriptor ever claimed. The second number is the one to watch: a
+     * load with no dxt is fetched with an interleave it was never given, which
+     * is the texture defect this reconstruction exists to fix. */
+    uint32_t loadsGivenDxt = 0;
+    uint32_t loadsWithoutDxt = 0;
+
     /* Framebuffer copies performed at the head of this frame's first stream,
      * requested out of band by videoCopyFramebuffer (T11). Counted because it
      * is the only visible evidence the pause-blur path ran at all: the request
@@ -288,6 +295,8 @@ private:
     /* EXT lowerings that expand to several canonical commands (SCAFFOLD 3.4).
      * Each leaves the RDP state it found: whatever colour image or cycle type
      * they change, they change back. */
+    static constexpr uint32_t kRenderTile = 0;   // G_TX_RENDERTILE
+    bool supplyDxtFromTile(uint32_t tileW0, uint32_t tileW1);
     void emitImageBlit(RdramAddr srcAddr, uint32_t sw, uint32_t sh, RdramAddr dstAddr,
                        uint32_t dw, uint32_t dh, uint32_t ulx, uint32_t uly, uint32_t lrx,
                        uint32_t lry, uint32_t dsdx, uint32_t dtdy, bool flip);
@@ -359,6 +368,22 @@ private:
     RdramAddr mainColorImage_ = 0;
     CommandHook hook_ = nullptr;
     std::vector<FbBlitRequest> pendingBlits_;
+
+    /*
+     * Tile descriptors as the stream sets them, and the block load waiting for
+     * one to name its row length. See noteTileDescriptor for why this is kept
+     * here rather than read back out of the emitted words: the port sets its
+     * load tile once per frame and never again, so the descriptor a load needs
+     * is the one that arrives after it, not before.
+     */
+    /* The block load waiting for a tile descriptor to name its row length. */
+    struct PendingLoad {
+        size_t pairIndex = 0;
+        uint32_t w0 = 0;
+        uint32_t w1 = 0;
+        bool valid = false;
+    };
+    PendingLoad pendingLoad_;
 };
 
 /* The extended opcode this translator registers with RT64. Must be nonzero and
