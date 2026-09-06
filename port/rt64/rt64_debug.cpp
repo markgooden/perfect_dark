@@ -1050,7 +1050,31 @@ std::string disasmCanonicalDl(const uint8_t *rdramBase, RdramAddr start,
 
         if (extendedOpcode && opcode == extendedOpcode) {
             nm = "G_EX";
-            f = fmt("op=%06x w1=%08x", p(w0, 0, 24), w1);
+            const uint32_t exOp = p(w0, 0, 24);
+            f = fmt("op=%06x w1=%08x", exOp, w1);
+
+            /*
+             * Some extended commands carry operand words, and those are not
+             * commands. Printing them as commands is not merely untidy: the
+             * viewport-align operand 0xfffefffe reads as a G_SETCIMG pointing
+             * at 0xfffefffe, which is exactly the sort of line a reader would
+             * stop on. Consume the operands here so the listing says what the
+             * stream means.
+             *
+             * Only the ones this translator emits are listed. An unknown
+             * extended opcode still prints as a single word, which is the
+             * honest answer when the length is not known.
+             */
+            uint32_t operandWords = 0;
+            if (exOp == 0x07) {     /* G_EX_SETVIEWPORTALIGN_V1, two words */
+                operandWords = 1;
+            }
+            for (uint32_t i = 0; i < operandWords && off + 8u * (i + 2u) <= to; ++i) {
+                const uint32_t o0 = word32(rdramBase, off + 8u * (i + 1u));
+                const uint32_t o1 = word32(rdramBase, off + 8u * (i + 1u) + 4u);
+                f += fmt(" operand%u=%08x,%08x", i, o0, o1);
+            }
+            off += 8u * operandWords;
         } else if (opcode == 0x00 && p(w0, 0, 24) == 0x525464) {
             /* The enable hook, which is also how this disassembler discovers
              * the extended opcode for the rest of the stream. */

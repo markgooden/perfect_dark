@@ -216,11 +216,17 @@ public:
     /* Shifts RT64's viewport by whole quarter-pixels, through RT64's own
      * G_EX_SETVIEWPORTALIGN. Measured 2026-09-06: RT64 draws the whole frame
      * exactly half a pixel right and down of the OpenGL path, uniformly - the
-     * best-matching offset is +0.500,+0.500 in every quadrant separately - and
-     * that accounts for 29% of the in-level pixel difference. (-2,-2) cancels
-     * it. Off by default: it changes the emitted stream, so every .disasm
-     * golden would move, and which of the two conventions matches hardware is
-     * not established. See docs/EFFECTS-GAPS.md section 2c. */
+     * best-matching offset is +0.500,+0.500 in every half-frame measured
+     * separately. kDefaultAlign cancels it, taking the in-level frame from
+     * mean 6.26/255 to 3.86 and the worst channel from 195 to 156.
+     *
+     * On by default, decided 2026-09-06 (docs/EFFECTS-GAPS.md section 2c): the
+     * two paths agreeing geometrically is worth more than the half-pixel,
+     * because every pixel comparison otherwise spends 38% of its budget on a
+     * convention instead of on defects. Pass (0, 0) to turn it off. */
+    static constexpr int16_t kDefaultAlignX = -2;
+    static constexpr int16_t kDefaultAlignY = -2;
+
     void setViewportAlign(int16_t quarterX, int16_t quarterY)
     {
         vpAlignX_ = quarterX;
@@ -379,8 +385,8 @@ private:
     bool validate_ = true;
     bool invertCulling_ = false;
     bool renderToRam_ = false;
-    int16_t vpAlignX_ = 0;
-    int16_t vpAlignY_ = 0;
+    int16_t vpAlignX_ = kDefaultAlignX;
+    int16_t vpAlignY_ = kDefaultAlignY;
     RdramAddr mainColorImage_ = 0;
     CommandHook hook_ = nullptr;
     std::vector<FbBlitRequest> pendingBlits_;
