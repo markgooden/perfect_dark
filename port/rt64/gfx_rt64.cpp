@@ -100,6 +100,13 @@ struct Backend {
     bool hashFrames = false;
     uint64_t frameCount = 0;
 
+    /* Totals reported at shutdown. The framebuffer path leaves no other trace:
+     * a copy is requested between frames and a created framebuffer may go
+     * unused for the whole run, so without these a clean log says nothing
+     * about whether either was exercised. */
+    uint64_t totalBlits = 0;
+    uint32_t framebuffersCreated = 0;
+
     /* One line per distinct translation failure, not one per frame. A backend
      * that has started failing every list would otherwise fill the log faster
      * than it could be read. */
@@ -143,6 +150,10 @@ void syncNativeMode()
     g_be.nativeWidth = w;
     g_be.nativeHeight = h;
     regsSetVideoMode(&g_be.regs, w, h);
+    /* The framebuffers the game asked to be "the same size as the main one"
+     * follow the mode too, or the pause blur composites a screen-sized image
+     * through a rectangle sized for the previous mode. */
+    g_be.fbs->setNativeSize(w, h);
     sysLogPrintf(LOG_NOTE, "rt64: native mode %ux%u", w, h);
 }
 
@@ -193,6 +204,11 @@ void rt64Init(const struct GfxInitSettings *settings)
     cfg.frameRegionBytes = kFrameRegionBytes;
     g_be.arena.reset(new Arena(cfg));
     g_be.fbs.reset(new FbRegistry(*g_be.arena));
+    /* Before any createFb call: three of the game's four framebuffers ask for
+     * "the same size as the main one" and are resolved against this. */
+    g_be.fbs->setNativeSize(
+        gfx_current_native_viewport.width ? gfx_current_native_viewport.width : 320,
+        gfx_current_native_viewport.height ? gfx_current_native_viewport.height : 220);
 
     g_be.mem.reset(new LiveMemReader(g_MempHeap, g_MempHeapSize, g_RomFile, g_RomFileSize,
         (const uint8_t *)regionsImageBase(), regionsImageSize(), &trackedAlloc));
@@ -249,6 +265,9 @@ void rt64Destroy(void)
         return;
     }
     g_be.ready = false;
+    sysLogPrintf(LOG_NOTE, "rt64: %llu frames, %u framebuffers created, %llu blits",
+        (unsigned long long)g_be.frameCount, g_be.framebuffersCreated,
+        (unsigned long long)g_be.totalBlits);
     /* The host goes first: RT64 holds the arena and the register block, and
      * must stop reading them before they are freed. */
     hostShutdown();
@@ -348,6 +367,7 @@ void rt64EndFrame(void)
             (unsigned long long)hash, st.commandsIn, st.commandsOut, st.droppedCommands);
     }
 
+    g_be.totalBlits += g_be.tr->stats().framebufferBlits;
     g_be.parity ^= 1;
     ++g_be.frameCount;
 
@@ -412,19 +432,26 @@ void rt64TextureCacheDeleteRange(const uint8_t *start, const uint8_t *end)
  * G_SETCIMG / G_SETTIMG against them, so RT64's own framebuffer manager
  * handles the copies and reinterpretation (SCAFFOLD ADR-4).
  *
- * upscale and autoresize are fast3d's business: it renders framebuffers at
- * window resolution and has to be told which ones follow a resize. Here every
- * image is native-resolution in the arena and RT64 upscales internally, so
- * there is nothing for the flags to select.
+ * `upscale` is fast3d's business: it renders framebuffers at window resolution
+ * and scales the small ones up. Here every image is native-resolution in the
+ * arena and RT64 upscales the lot internally, so there is nothing to select.
+ * `autoresize` does matter, and reaches the registry.
  */
 int rt64CreateFramebuffer(uint32_t width, uint32_t height, int upscale, int autoresize)
 {
     (void)upscale;
-    (void)autoresize;
     if (!g_be.fbs) {
         return 0;
     }
-    return g_be.fbs->createFb(width, height);
+    const int fb = g_be.fbs->createFb(width, height, autoresize != 0);
+    uint32_t w = 0, h = 0;
+    g_be.fbs->fbSize(fb, &w, &h);
+    /* Four or five per run, so logging each one costs nothing and is the only
+     * record that the game asked for a framebuffer at all. */
+    sysLogPrintf(LOG_NOTE, "rt64: framebuffer %d = %ux%u%s", fb, w, h,
+        (autoresize || !width || !height) ? " (follows the video mode)" : "");
+    ++g_be.framebuffersCreated;
+    return fb;
 }
 
 void rt64ResizeFramebuffer(int fb, uint32_t width, uint32_t height, int upscale, int autoresize)
@@ -437,20 +464,74 @@ void rt64ResizeFramebuffer(int fb, uint32_t width, uint32_t height, int upscale,
 }
 
 /*
- * Binding a framebuffer as the render target, and the blur/noise effects on
- * top of it, are task T11. The translator already lowers the display list's
- * own _EXT framebuffer commands, which is what the menus actually use; these
- * three entry points are the video.c-driven half and are inert until T11.
+ * Retarget subsequent drawing at one of the game's framebuffers.
+ *
+ * Nothing in this codebase calls videoSetFramebuffer or videoResetFramebuffer
+ * - checked across src/ and port/, the only references are the declarations
+ * and video.c's own wrappers - so this mapping is unexercised. It is written
+ * anyway, and written to be the obvious thing rather than nothing, because a
+ * silent no-op here would be indistinguishable from a rendering bug if a
+ * caller ever appeared.
+ *
+ * `noiseScale` is fast3d's dither seed for the framebuffer it is about to draw
+ * into; RT64 has no equivalent knob on this path.
  */
-void rt64SetFramebuffer(int fb, float noiseScale) { (void)fb; (void)noiseScale; }
-void rt64ResetFramebuffer(void) {}
+void rt64SetFramebuffer(int fb, float noiseScale)
+{
+    (void)noiseScale;
+    if (!g_be.ready || fb <= 0) {
+        return;
+    }
+    g_be.tr->setMainColorImage(g_be.fbs->fbAddress(fb));
+}
+
+void rt64ResetFramebuffer(void)
+{
+    if (!g_be.ready) {
+        return;
+    }
+    /* Back to whichever main colour image this frame belongs to, not to
+     * image 0 - they alternate. */
+    g_be.tr->setMainColorImage(g_be.fbs->mainColorImage(g_be.parity));
+}
+
+/*
+ * Copy the frame that was just rendered into one of the game's framebuffers.
+ *
+ * This is how the pause blur is seeded: the whole screen is downscaled into a
+ * 40x30 buffer (menugfx.c:133) which the display list then magnifies back up
+ * with G_TF_BLUR_EXT, and the scheduler does the same into g_BlurFb every
+ * frame it is asked to (pdsched.c:392).
+ *
+ * It arrives between frames - schedConsiderScreenshot runs after videoEndFrame
+ * (pdsched.c:300-303) - so the source is the image the frame just ended drew
+ * into, which is parity^1 by the time this is called. Recording the resolved
+ * address rather than the handle is what makes that unambiguous. The copy
+ * itself is queued and performed as commands at the head of the next stream:
+ * RT64 has no copy API, and doing it on the CPU would mean reading the
+ * framebuffer back every frame, which is the one thing render-to-RAM exists to
+ * avoid in normal play.
+ */
 void rt64CopyFramebuffer(int dst, int src, int left, int top, int useBack)
 {
-    (void)dst;
-    (void)src;
     (void)left;
     (void)top;
     (void)useBack;
+    if (!g_be.ready || dst <= 0) {
+        return;
+    }
+
+    Translator::FbBlitRequest req;
+    req.dstFb = dst;
+    if (src <= 0) {
+        req.srcImage = g_be.fbs->mainColorImage(g_be.parity ^ 1);
+        req.srcWidth = g_be.nativeWidth;
+        req.srcHeight = g_be.nativeHeight;
+    } else {
+        req.srcImage = g_be.fbs->fbAddress(src);
+        g_be.fbs->fbSize(src, &req.srcWidth, &req.srcHeight);
+    }
+    g_be.tr->queueFramebufferBlit(req);
 }
 
 } // namespace

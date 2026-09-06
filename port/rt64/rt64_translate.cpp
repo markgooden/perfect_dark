@@ -173,6 +173,15 @@ void Translator::beginFrame()
     error_.clear();
 }
 
+/* Framebuffer handle 0 is the main colour image, and which of the two that is
+ * changes every frame. Resolving it through the registry instead would always
+ * name the first one, so a blit reading "the screen" on an odd frame would read
+ * the buffer the previous frame drew into. */
+RdramAddr Translator::fbImage(int fb) const
+{
+    return fb <= 0 ? mainCimg_ : fbs_.fbAddress(fb);
+}
+
 RdramAddr Translator::currentMainColorImage() const
 {
     /* Defaults to the first image, so a caller that never sets one still
@@ -314,33 +323,26 @@ void Translator::emitDepthClear()
          otherModeH_ & (3u << 20));
 }
 
-void Translator::emitFramebufferCopy(const Gfx &cmd)
+void Translator::emitImageBlit(RdramAddr srcAddr, uint32_t sw, uint32_t sh,
+                              RdramAddr dstAddr, uint32_t dw, uint32_t dh,
+                              uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry,
+                              uint32_t dsdx, uint32_t dtdy, bool flip)
 {
-    /* f3d_copy_framebuffer(dst, src, x, y, flip) (gfx_pc.cpp:2524). Lowered to
-     * the sequence that copies one image into another through the texture
-     * unit: bind the destination, bind the source as a texture, describe it as
-     * a tile, and draw a rectangle over it. */
-    const uint32_t dst = (uint32_t)((cmd.words.w0 >> 11) & 0x7ff);
-    const uint32_t src = (uint32_t)(cmd.words.w0 & 0x7ff);
-    const int16_t x = (int16_t)((cmd.words.w1 >> 16) & 0xffff);
-    const int16_t y = (int16_t)(cmd.words.w1 & 0xffff);
-    const uint32_t flip = (uint32_t)((cmd.words.w0 >> 22) & 1);
-
+    /* One image into another through the texture unit: bind the destination as
+     * the colour image, bind the source as a texture, describe it as a tile,
+     * and draw a rectangle over it. The colour image the stream was using is
+     * saved and restored, because a blit is not supposed to be visible to the
+     * commands around it. */
     const uint32_t savedW0 = boundCimgW0_;
     const RdramAddr savedAddr = boundCimg_;
 
-    uint32_t sw = 0, sh = 0;
-    fbs_.fbSize((int)src, &sw, &sh);
-    uint32_t dw = 0, dh = 0;
-    fbs_.fbSize((int)dst, &dw, &dh);
-
     emitSetColorImage(((uint32_t)(uint8_t)G_SETCIMG << 24) | (2u << 19) |
                           ((dw ? dw - 1 : 0) & 0xfff),
-                      fbs_.fbAddress((int)dst));
+                      dstAddr);
 
     emit(((uint32_t)(uint8_t)G_SETTIMG << 24) | (2u << 19) |
              ((sw ? sw - 1 : 0) & 0xfff),
-         fbs_.fbAddress((int)src));
+         srcAddr);
 
     /* Tile 0, RGBA16. `line` counts 64-bit words per row, which for 16-bit
      * texels is width/4. */
@@ -348,18 +350,69 @@ void Translator::emitFramebufferCopy(const Gfx &cmd)
     emit(((uint32_t)(uint8_t)G_SETTILESIZE << 24),
          ((sw ? (sw - 1) << 2 : 0) << 12) | (sh ? (sh - 1) << 2 : 0));
 
-    /* One rectangle over the destination region, sampled 1:1 - dsdx and dtdy
-     * are 1.0 in the 5.10 fixed point the RDP uses for them. */
+    const uint8_t rectOp = flip ? (uint8_t)G_TEXRECTFLIP : (uint8_t)G_TEXRECT;
+    emit(((uint32_t)rectOp << 24) | ((lrx & 0xfff) << 12) | (lry & 0xfff),
+         ((ulx & 0xfff) << 12) | (uly & 0xfff));
+    emit((uint32_t)kCanonRdpHalf1 << 24, 0);
+    emit((uint32_t)kCanonRdpHalf2 << 24, ((dsdx & 0xffff) << 16) | (dtdy & 0xffff));
+
+    emitSetColorImage(savedW0, savedAddr);
+}
+
+void Translator::emitFramebufferCopy(const Gfx &cmd)
+{
+    /* f3d_copy_framebuffer(dst, src, x, y, flip) (gfx_pc.cpp:2524), as it
+     * arrives in the display list. The rectangle is the source's size placed at
+     * the command's offset, sampled 1:1 - dsdx and dtdy are 1.0 in the 5.10
+     * fixed point the RDP uses. Its callers copy between equally sized images
+     * (bondview.c), so no scaling is implied here; the out-of-band API copy
+     * does scale, and goes through emitScaledBlit instead. */
+    const uint32_t dst = (uint32_t)((cmd.words.w0 >> 11) & 0x7ff);
+    const uint32_t src = (uint32_t)(cmd.words.w0 & 0x7ff);
+    const int16_t x = (int16_t)((cmd.words.w1 >> 16) & 0xffff);
+    const int16_t y = (int16_t)(cmd.words.w1 & 0xffff);
+    const uint32_t flip = (uint32_t)((cmd.words.w0 >> 22) & 1);
+
+    uint32_t sw = 0, sh = 0;
+    fbs_.fbSize((int)src, &sw, &sh);
+    uint32_t dw = 0, dh = 0;
+    fbs_.fbSize((int)dst, &dw, &dh);
+
     const uint32_t ulx = (uint32_t)((x < 0 ? 0 : x) << 2) & 0xfff;
     const uint32_t uly = (uint32_t)((y < 0 ? 0 : y) << 2) & 0xfff;
     const uint32_t lrx = (ulx + (sw ? (sw - 1) << 2 : 0)) & 0xfff;
     const uint32_t lry = (uly + (sh ? (sh - 1) << 2 : 0)) & 0xfff;
-    const uint8_t rectOp = flip ? (uint8_t)G_TEXRECTFLIP : (uint8_t)G_TEXRECT;
-    emit(((uint32_t)rectOp << 24) | (lrx << 12) | lry, (ulx << 12) | uly);
-    emit((uint32_t)kCanonRdpHalf1 << 24, 0);
-    emit((uint32_t)kCanonRdpHalf2 << 24, (0x0400u << 16) | 0x0400u);
 
-    emitSetColorImage(savedW0, savedAddr);
+    emitImageBlit(fbImage((int)src), sw, sh, fbImage((int)dst), dw, dh, ulx, uly, lrx,
+                  lry, 0x0400u, 0x0400u, flip != 0);
+}
+
+/*
+ * The out-of-band copy, requested through videoCopyFramebuffer rather than
+ * through the display list, and emitted at the head of the next stream.
+ *
+ * It scales, which the display-list copy above does not need to: its one real
+ * caller downscales the whole screen into a 40x30 buffer that the pause blur
+ * then magnifies back up (menugfx.c:129-133). A 1:1 rectangle would write a
+ * screen-sized region into a 40x30 image.
+ */
+void Translator::emitScaledBlit(const FbBlitRequest &req)
+{
+    uint32_t dw = 0, dh = 0;
+    fbs_.fbSize(req.dstFb, &dw, &dh);
+    if (!dw || !dh || !req.srcWidth || !req.srcHeight) {
+        return;
+    }
+
+    /* The rectangle covers the whole destination; the texture coordinates
+     * advance by source-pixels-per-destination-pixel, in the 5.10 fixed point
+     * the RDP reads them as. */
+    const uint32_t dsdx = (req.srcWidth << 10) / dw;
+    const uint32_t dtdy = (req.srcHeight << 10) / dh;
+
+    emitImageBlit(req.srcImage, req.srcWidth, req.srcHeight, fbs_.fbAddress(req.dstFb), dw,
+                  dh, 0, 0, (dw - 1) << 2, (dh - 1) << 2, dsdx, dtdy, false);
+    ++stats_.framebufferBlits;
 }
 
 void Translator::emitImageRect(const Gfx *cmd)
@@ -1255,6 +1308,16 @@ TranslateStatus Translator::translate(uintptr_t rootDl, RdramAddr *outStart,
     out_.clear();
     error_.clear();
     emitStreamPrefix();
+
+    /* Copies requested outside the display list happen between frames -
+     * schedConsiderScreenshot runs after videoEndFrame (pdsched.c:300-303) -
+     * so they are performed at the head of the next stream, which is the first
+     * point at which we are emitting commands again. Drained rather than
+     * replayed, so a frame with several root lists does them once. */
+    for (const FbBlitRequest &req : pendingBlits_) {
+        emitScaledBlit(req);
+    }
+    pendingBlits_.clear();
 
     const TranslateStatus status = walk(rootDl, 0);
     if (status != TranslateStatus::Ok) {

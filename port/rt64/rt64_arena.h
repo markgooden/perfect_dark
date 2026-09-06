@@ -140,9 +140,33 @@ public:
     RdramAddr mainColorImage(int index) const; // index in {0,1}
     RdramAddr depthImage() const;
 
-    /* Handle management mirroring the gfx_api framebuffer calls. Returns
-     * a small positive handle. Resizing reallocates in the fb region. */
-    int  createFb(uint32_t width, uint32_t height);
+    /*
+     * The game's current native resolution, which is what "same size as the
+     * main framebuffer" means. Dynamic: pdsched.c:213 switches between lo- and
+     * hi-res, so this is set every time the mode changes, and autoresize
+     * framebuffers follow it.
+     */
+    void setNativeSize(uint32_t width, uint32_t height);
+    void nativeSize(uint32_t *width, uint32_t *height) const;
+
+    /*
+     * Handle management mirroring the gfx_api framebuffer calls. Returns a
+     * small positive handle.
+     *
+     * Width and height of zero mean "the same size as the main framebuffer",
+     * which is what three of the game's four framebuffers ask for
+     * (pdsched.c:184-185, menugfx.c:130) and what fast3d resolves against its
+     * own current dimensions (gfx_pc.cpp:2802-2808). Such a framebuffer is
+     * autoresizing whether or not the caller said so, again matching fast3d.
+     *
+     * An autoresizing framebuffer is allocated at the largest native mode once
+     * and only its recorded dimensions change afterwards. resizeFb has to
+     * reallocate because the caller may ask for something bigger than what is
+     * there, and the old bytes leak; doing that on every video mode change,
+     * for framebuffers whose whole purpose is to track the mode, would leak
+     * the fb region away.
+     */
+    int  createFb(uint32_t width, uint32_t height, bool autoresize = false);
     void resizeFb(int fb, uint32_t width, uint32_t height);
 
     /* Address + dimensions for a handle. Used by the translator to turn
@@ -157,9 +181,15 @@ private:
         RdramAddr addr;
         uint32_t width;
         uint32_t height;
+        bool autoresize;
+        /* Bytes actually allocated, so a resize can reuse the allocation when
+         * the new size fits rather than leaking a fresh one. */
+        size_t capacity;
     };
 
     Arena &arena_;
+    uint32_t nativeWidth_ = 320;
+    uint32_t nativeHeight_ = 220;
     RdramAddr mainColor_[2] = {0, 0};
     RdramAddr depth_ = 0;
     std::vector<Fb> fbs_;   // index 0 unused; handles are 1-based

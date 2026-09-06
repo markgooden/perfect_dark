@@ -140,6 +140,13 @@ struct TranslateStats {
      * stays a placeholder, which is harmless - RT64 only stores it - but a
      * nonzero count means the deferred-sizing assumption needs revisiting. */
     uint32_t unsizedImages = 0;
+
+    /* Framebuffer copies performed at the head of this frame's first stream,
+     * requested out of band by videoCopyFramebuffer (T11). Counted because it
+     * is the only visible evidence the pause-blur path ran at all: the request
+     * arrives between frames and leaves no trace in the display list the game
+     * submitted. */
+    uint32_t framebufferBlits = 0;
 };
 
 /*
@@ -213,6 +220,30 @@ public:
     using CommandHook = void (*)(const Gfx *cmd, const uintptr_t *segments);
     void setCommandHook(CommandHook hook) { hook_ = hook; }
 
+    /*
+     * A framebuffer copy asked for outside the display list, by
+     * videoCopyFramebuffer (menugfx.c:133, pdsched.c:392).
+     *
+     * Those calls land between frames - schedConsiderScreenshot runs after
+     * videoEndFrame (pdsched.c:300-303) - and mean "copy the frame just
+     * rendered into this buffer". There is no RT64 API for that, and doing it
+     * as a CPU copy would mean reading back the framebuffer every frame; so
+     * the request is queued and performed as commands at the head of the next
+     * stream, where RT64's framebuffer manager handles it on the GPU like any
+     * other image-to-image copy (SCAFFOLD ADR-4).
+     *
+     * The source is carried as a resolved address rather than a handle,
+     * because by the time the request is emitted the frame has flipped and
+     * "the main framebuffer" no longer names the image the caller meant.
+     */
+    struct FbBlitRequest {
+        int dstFb = 0;
+        RdramAddr srcImage = 0;
+        uint32_t srcWidth = 0;
+        uint32_t srcHeight = 0;
+    };
+    void queueFramebufferBlit(const FbBlitRequest &req) { pendingBlits_.push_back(req); }
+
     /* Which arena image the game's own G_SETCIMG refers to this frame.
      *
      * The game names its back buffer; we render into synthetic RDRAM, so that
@@ -225,6 +256,7 @@ public:
 
 private:
     RdramAddr currentMainColorImage() const;
+    RdramAddr fbImage(int fb) const;
     void emit(uint32_t w0, uint32_t w1);
     void emitStreamPrefix();
 
@@ -249,6 +281,10 @@ private:
     /* EXT lowerings that expand to several canonical commands (SCAFFOLD 3.4).
      * Each leaves the RDP state it found: whatever colour image or cycle type
      * they change, they change back. */
+    void emitImageBlit(RdramAddr srcAddr, uint32_t sw, uint32_t sh, RdramAddr dstAddr,
+                       uint32_t dw, uint32_t dh, uint32_t ulx, uint32_t uly, uint32_t lrx,
+                       uint32_t lry, uint32_t dsdx, uint32_t dtdy, bool flip);
+    void emitScaledBlit(const FbBlitRequest &req);
     void emitSetColorImage(uint32_t w0, RdramAddr addr);
     void emitDepthClear();
     void emitFramebufferCopy(const Gfx &cmd);
@@ -315,6 +351,7 @@ private:
     bool renderToRam_ = false;
     RdramAddr mainColorImage_ = 0;
     CommandHook hook_ = nullptr;
+    std::vector<FbBlitRequest> pendingBlits_;
 };
 
 /* The extended opcode this translator registers with RT64. Must be nonzero and

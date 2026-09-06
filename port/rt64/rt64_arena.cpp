@@ -206,7 +206,36 @@ FbRegistry::FbRegistry(Arena &arena) : arena_(arena)
     mainColor_[0] = arena_.allocFramebuffer(maxImage);
     mainColor_[1] = arena_.allocFramebuffer(maxImage);
     depth_ = arena_.allocFramebuffer(maxImage);
-    fbs_.push_back(Fb{0, 0, 0}); // handle 0 is "the current main image"
+    fbs_.push_back(Fb{0, 0, 0, false, 0}); // handle 0 is "the current main image"
+}
+
+void FbRegistry::setNativeSize(uint32_t width, uint32_t height)
+{
+    if (!width || !height || (width == nativeWidth_ && height == nativeHeight_)) {
+        return;
+    }
+    nativeWidth_ = width;
+    nativeHeight_ = height;
+
+    /* Every autoresizing framebuffer was allocated for the largest mode, so
+     * following the new one is a change of recorded dimensions and nothing
+     * else - no allocation, and therefore nothing to leak. */
+    for (size_t i = 1; i < fbs_.size(); ++i) {
+        if (fbs_[i].autoresize) {
+            fbs_[i].width = width;
+            fbs_[i].height = height;
+        }
+    }
+}
+
+void FbRegistry::nativeSize(uint32_t *width, uint32_t *height) const
+{
+    if (width) {
+        *width = nativeWidth_;
+    }
+    if (height) {
+        *height = nativeHeight_;
+    }
 }
 
 RdramAddr FbRegistry::mainColorImage(int index) const
@@ -220,10 +249,26 @@ RdramAddr FbRegistry::depthImage() const
     return depth_;
 }
 
-int FbRegistry::createFb(uint32_t width, uint32_t height)
+int FbRegistry::createFb(uint32_t width, uint32_t height, bool autoresize)
 {
-    const RdramAddr addr = arena_.allocFramebuffer(imageBytes(width, height));
-    fbs_.push_back(Fb{addr, width, height});
+    /* Zero means "the same size as the main framebuffer", and such a
+     * framebuffer tracks the mode whatever the caller passed for autoresize -
+     * the same resolution fast3d makes (gfx_pc.cpp:2802-2808). Without this a
+     * zero-sized image would be allocated, and the three framebuffers the game
+     * asks for this way would be bound as colour images of width zero. */
+    if (!width || !height) {
+        width = nativeWidth_;
+        height = nativeHeight_;
+        autoresize = true;
+    }
+
+    /* An autoresizing framebuffer is allocated for the largest native mode, so
+     * a later mode change costs nothing. A fixed-size one gets exactly what it
+     * asked for. */
+    const size_t capacity =
+        autoresize ? imageBytes(kMaxNativeWidth, kMaxNativeHeight) : imageBytes(width, height);
+    const RdramAddr addr = arena_.allocFramebuffer(capacity);
+    fbs_.push_back(Fb{addr, width, height, autoresize, capacity});
     return static_cast<int>(fbs_.size()) - 1;
 }
 
@@ -233,14 +278,24 @@ void FbRegistry::resizeFb(int fb, uint32_t width, uint32_t height)
         return;
     }
     Fb &slot = fbs_[static_cast<size_t>(fb)];
+    if (!width || !height) {
+        width = nativeWidth_;
+        height = nativeHeight_;
+        slot.autoresize = true;
+    }
     if (slot.width == width && slot.height == height) {
         return;
     }
-    /* Reallocate rather than resize in place; the old bytes leak until the
-     * arena is rebuilt. Framebuffer resizes happen on mode changes, not per
-     * frame, so the leak is bounded by how often the user toggles video
-     * settings. */
-    slot.addr = arena_.allocFramebuffer(imageBytes(width, height));
+
+    const size_t needed = imageBytes(width, height);
+    if (needed > slot.capacity) {
+        /* Reallocate; the old bytes leak until the arena is rebuilt. Bounded
+         * by how often the user toggles video settings - and not reached at
+         * all by a framebuffer that was allocated for the largest mode, which
+         * is why the autoresizing ones do not leak on a mode change. */
+        slot.addr = arena_.allocFramebuffer(needed);
+        slot.capacity = needed;
+    }
     slot.width = width;
     slot.height = height;
 }
@@ -255,8 +310,11 @@ RdramAddr FbRegistry::fbAddress(int fb) const
 
 void FbRegistry::fbSize(int fb, uint32_t *width, uint32_t *height) const
 {
-    uint32_t w = kMaxNativeWidth;
-    uint32_t h = kMaxNativeHeight;
+    /* Handle 0 is the main colour image, which is native-sized. Reporting the
+     * largest mode here instead would describe the wrong image to every
+     * lowering that binds it. */
+    uint32_t w = nativeWidth_;
+    uint32_t h = nativeHeight_;
     if (fb > 0 && static_cast<size_t>(fb) < fbs_.size()) {
         w = fbs_[static_cast<size_t>(fb)].width;
         h = fbs_[static_cast<size_t>(fb)].height;
