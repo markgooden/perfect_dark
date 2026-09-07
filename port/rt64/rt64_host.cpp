@@ -45,6 +45,7 @@ void hostUpdateScreen() {}
 #else
 
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 
 #include "gbi/rt64_gbi_f3dpd.h"
@@ -159,6 +160,73 @@ void applyFiltering()
      * not their size or format, so throwing the framebuffers away would cost a
      * visible reallocation for nothing. */
     g_host.app->updateUserConfig(false);
+}
+
+/*
+ * Turns the path tracer on from the environment, for development runs.
+ *
+ * RT64 already has a toggle - F2, via DeveloperShortcut::RayTracing
+ * (rt64_application.cpp:580,658) - but it arrives through RT64's own window
+ * message and SDL event filters, and this port never installs either: the port
+ * owns the window and RT64 only ever receives display lists. Rather than route
+ * input across the shim boundary for a development switch, the two values a
+ * test run needs are read once at init.
+ *
+ *   PDRT64_RT=1        enable the path tracer
+ *   PDRT64_RT_VIZ=<n>  VisualizationMode, per the enum's declaration order in
+ *                      rt64_raytracing_params.h. 5 is InstanceId, which is the
+ *                      one that shows whether the TLAS is built correctly.
+ *
+ * Deliberately not part of the shim ABI. When path tracing becomes something a
+ * player turns on it belongs in the port's own options and the ABI, and adding
+ * an export now would freeze a shape that has not been designed yet.
+ *
+ * Guarded on RT_ENABLED because rtConfig, VisualizationMode and
+ * WorkloadQueue::rtEnabled only exist in a raytracing build of RT64. A shim
+ * built against a raster-only RT64 compiles this away entirely.
+ */
+void applyRaytracingEnvironment()
+{
+#if RT_ENABLED
+    if (!g_host.app) {
+        return;
+    }
+
+    const char *enable = getenv("PDRT64_RT");
+    if ((enable == nullptr) || (enable[0] == '0') || (enable[0] == '\0')) {
+        return;
+    }
+
+    if (g_host.app->device && !g_host.app->device->getCapabilities().raytracing) {
+        printf("rt64: PDRT64_RT is set but the device reports no raytracing support; staying on the raster path\n");
+        fflush(stdout);
+        return;
+    }
+
+    RT64::RaytracingConfiguration rtConfig = g_host.app->rtConfig;
+
+    const char *viz = getenv("PDRT64_RT_VIZ");
+    if (viz != nullptr) {
+        const int mode = atoi(viz);
+        if ((mode >= 0) && (mode < (int)interop::VisualizationMode::Count)) {
+            rtConfig.visualizationMode = (interop::VisualizationMode)mode;
+        }
+    }
+
+    g_host.app->rtConfig = rtConfig;
+
+    /* setRtConfig rather than assigning sharedQueueResources->rtConfig: it
+     * takes the configuration mutex and raises rtConfigChanged, and that flag
+     * is what makes the workload queue compile the RT pipeline and push the
+     * configuration into the renderer (rt64_workload_queue.cpp:242-249). Set
+     * before rtEnabled so the first frame that traces already has both. */
+    g_host.app->sharedQueueResources->setRtConfig(rtConfig);
+    g_host.app->workloadQueue->rtEnabled = true;
+
+    printf("rt64: path tracing enabled from the environment, visualizationMode=%d\n",
+           (int)rtConfig.visualizationMode);
+    fflush(stdout);
+#endif
 }
 
 /* Wires the register block into Core. Application::Core::decodeVI reads
@@ -305,6 +373,9 @@ HostResult hostInit(const HostConfig &cfg)
                (int)caps.raytracing, (int)caps.raytracingStateUpdate);
         fflush(stdout);
     }
+
+    applyRaytracingEnvironment();
+
     return HostResult::Ok;
 }
 
