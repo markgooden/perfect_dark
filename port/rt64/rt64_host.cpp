@@ -227,6 +227,29 @@ void applyRaytracingDebugLayer()
     }
 
     debug->EnableDebugLayer();
+
+    /* GPU-based validation, when asked for on top of the layer. The plain layer checks
+     * calls; this one instruments the shaders and checks what they actually touch -
+     * descriptors that were never written, reads outside a resource, a resource in the
+     * wrong state for the access. That is the class of fault left after a dispatch dies
+     * with every call reported valid, and it is the reason this exists separately: it is
+     * far slower than the layer alone, so it is worth having only when the layer has
+     * already come up clean. */
+    const char *gpuValidation = getenv("PDRT64_RT_GPUVALIDATION");
+    if ((gpuValidation != nullptr) && (gpuValidation[0] != '0') && (gpuValidation[0] != '\0')) {
+        ID3D12Debug1 *debug1 = nullptr;
+        if (SUCCEEDED(debug->QueryInterface(IID_PPV_ARGS(&debug1)))) {
+            debug1->SetEnableGPUBasedValidation(TRUE);
+            debug1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+            debug1->Release();
+            printf("rt64: GPU-based validation enabled - slow, and reports what the shaders touch\n");
+        }
+        else {
+            printf("rt64: GPU-based validation was requested but ID3D12Debug1 is not available\n");
+        }
+        fflush(stdout);
+    }
+
     debug->Release();
     printf("rt64: D3D12 debug layer enabled - validation errors will be reported as they happen\n");
     fflush(stdout);
