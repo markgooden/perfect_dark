@@ -246,6 +246,24 @@ void applyRaytracingEnvironment()
 
     RT64::RaytracingConfiguration rtConfig = g_host.app->rtConfig;
 
+    /* Forces the render resolution, which is what the path tracer sizes every one of
+     * its buffers from. Without this the scale comes from the swap chain, so the
+     * replay harness - which renders into a hidden window - always traces at the
+     * N64 resolution and cannot reproduce anything that only breaks at the size a
+     * real window asks for. Two bugs in a row were exactly that, so the harness
+     * needs to be able to ask for the same size. */
+    const char *resScale = getenv("PDRT64_RT_RESSCALE");
+    if (resScale != nullptr) {
+        const double scale = atof(resScale);
+        if (scale > 0.0) {
+            g_host.app->userConfig.resolution = RT64::UserConfiguration::Resolution::Manual;
+            g_host.app->userConfig.resolutionMultiplier = scale;
+            g_host.app->updateUserConfig(true);
+            printf("rt64: render resolution forced to %gx native\n", scale);
+            fflush(stdout);
+        }
+    }
+
     const char *viz = getenv("PDRT64_RT_VIZ");
     if (viz != nullptr) {
         const int mode = atoi(viz);
