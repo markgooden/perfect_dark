@@ -202,6 +202,37 @@ void applyFiltering()
  * Off unless asked for. It costs performance on every submission, and the raster path
  * has no need of it.
  */
+/*
+ * Turns on the D3D12 debug layer, which also has to happen before the device is
+ * created. DRED has reported nothing useful here - no breadcrumbs, no page fault -
+ * and the debug layer answers a different question: not which GPU operation died,
+ * but which API call was invalid. A removed device is nearly always preceded by one.
+ *
+ * Needs the Graphics Tools optional feature installed, and says so if it is missing
+ * rather than failing quietly. Costs a great deal of performance, so it is opt-in.
+ */
+void applyRaytracingDebugLayer()
+{
+#if RT_ENABLED && defined(_WIN32)
+    const char *want = getenv("PDRT64_RT_DEBUGLAYER");
+    if ((want == nullptr) || (want[0] == '0') || (want[0] == '\0')) {
+        return;
+    }
+
+    ID3D12Debug *debug = nullptr;
+    if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+        printf("rt64: the debug layer was requested but is not available; install the Graphics Tools optional feature\n");
+        fflush(stdout);
+        return;
+    }
+
+    debug->EnableDebugLayer();
+    debug->Release();
+    printf("rt64: D3D12 debug layer enabled - validation errors will be reported as they happen\n");
+    fflush(stdout);
+#endif
+}
+
 void applyRaytracingDred()
 {
 #if RT_ENABLED && defined(_WIN32)
@@ -393,6 +424,7 @@ HostResult hostInit(const HostConfig &cfg)
     wireRegisters(g_host.core, cfg.regs);
     g_host.core.checkInterrupts = &checkInterrupts;
 
+    applyRaytracingDebugLayer();
     applyRaytracingDred();
 
     RT64::ApplicationConfiguration appConfig;
