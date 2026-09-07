@@ -48,6 +48,11 @@ void hostUpdateScreen() {}
 #include <cstdlib>
 #include <memory>
 
+#if RT_ENABLED && defined(_WIN32)
+/* For DRED. RT64 links d3d12 already; this only needs the declarations. */
+#   include <d3d12.h>
+#endif
+
 #include "gbi/rt64_gbi_f3dpd.h"
 #include "gbi/rt64_gbi_rdp.h"
 #include "hle/rt64_application.h"
@@ -185,6 +190,42 @@ void applyFiltering()
  * WorkloadQueue::rtEnabled only exist in a raytracing build of RT64. A shim
  * built against a raster-only RT64 compiles this away entirely.
  */
+/*
+ * Turns on Device Removed Extended Data, which has to happen before the device is
+ * created to be of any use.
+ *
+ * A GPU fault shows up as DXGI_ERROR_DEVICE_REMOVED on some later, unrelated call -
+ * the first symptom here was a buffer allocation failing three calls downstream of
+ * the actual cause. DRED records which GPU operations completed, so the breadcrumbs
+ * name the one that faulted instead.
+ *
+ * Off unless asked for. It costs performance on every submission, and the raster path
+ * has no need of it.
+ */
+void applyRaytracingDred()
+{
+#if RT_ENABLED && defined(_WIN32)
+    const char *dred = getenv("PDRT64_RT_DRED");
+    if ((dred == nullptr) || (dred[0] == '0') || (dred[0] == '\0')) {
+        return;
+    }
+
+    ID3D12DeviceRemovedExtendedDataSettings1 *settings = nullptr;
+    if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&settings)))) {
+        printf("rt64: DRED was requested but D3D12GetDebugInterface refused; is the Graphics Tools feature installed?\n");
+        fflush(stdout);
+        return;
+    }
+
+    settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    settings->Release();
+
+    printf("rt64: DRED enabled - a device removal will name the GPU operation that caused it\n");
+    fflush(stdout);
+#endif
+}
+
 void applyRaytracingEnvironment()
 {
 #if RT_ENABLED
@@ -333,6 +374,8 @@ HostResult hostInit(const HostConfig &cfg)
 
     wireRegisters(g_host.core, cfg.regs);
     g_host.core.checkInterrupts = &checkInterrupts;
+
+    applyRaytracingDred();
 
     RT64::ApplicationConfiguration appConfig;
     if (cfg.dataPath) {
