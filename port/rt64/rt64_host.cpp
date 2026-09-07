@@ -303,6 +303,21 @@ void applyRaytracingEnvironment()
         }
     }
 
+    /* Fraction of the display resolution to trace at. RT64 renders at the window's
+     * size, and every ray generation dispatch and RT buffer is sized from it - 110 ms
+     * of GPU time per frame at 2880x1980, measured against 21 ms with the path tracer
+     * off, which is what trips the driver's two second timeout. Tracing below the
+     * display resolution and composing back up is the normal arrangement. */
+    const char *rtScale = getenv("PDRT64_RT_SCALE");
+    if (rtScale != nullptr) {
+        const float scale = float(atof(rtScale));
+        if (scale > 0.0f) {
+            rtConfig.resolutionScale = scale;
+            printf("rt64: tracing at %g of the display resolution\n", scale);
+            fflush(stdout);
+        }
+    }
+
     g_host.app->rtConfig = rtConfig;
 
     /* setRtConfig rather than assigning sharedQueueResources->rtConfig: it
