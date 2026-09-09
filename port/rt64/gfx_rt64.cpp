@@ -40,6 +40,7 @@ extern "C" {
 #include "config.h"
 #include "../fast3d/gfx_graphics_api.h"
 #include "rt64_capture.h"
+#include "rt64_lights.h"
 /* The port's private opcodes, for the survey's watchlist. Safe here for the
  * same reason it is safe in rt64_capture.cpp: this file includes the port's
  * gbi.h and never RT64's, and the two must not meet in one translation unit. */
@@ -487,6 +488,43 @@ void rt64StartFrame(void)
 {
     if (!g_be.ready) {
         return;
+    }
+
+    /* PDRT64_RT_DUMPLIGHTS: what the game's own lights amount to per frame.
+     *
+     * The RSP light path carries almost nothing here - 32 of 5878 vertices on an in-level
+     * frame - so the lights a path tracer needs have to come from the game's room lights
+     * instead. This says how many there are before anything is built on them: how many
+     * rooms are on screen, how many of those are lit, and how many of their lights are
+     * switched on. Counting is separate from writing, because a cap that truncates looks
+     * exactly like a level with few lights. */
+    {
+        static const char *dumpLights = nullptr;
+        static bool dumpLightsChecked = false;
+        if (!dumpLightsChecked) {
+            dumpLights = getenv("PDRT64_RT_DUMPLIGHTS");
+            dumpLightsChecked = true;
+        }
+
+        if (dumpLights) {
+            static uint32_t lightFrames = 0;
+            const uint32_t every = (uint32_t)((atoi(dumpLights) > 0) ? atoi(dumpLights) : 120);
+            if ((lightFrames++ % every) == 0) {
+                struct pdrt64Light lights[256];
+                struct pdrt64LightStats stats;
+                const int written = pdrt64GatherRoomLights(lights, 256, &stats);
+                fprintf(stderr, "rt64: lights - %d rooms on screen, %d lit, %d lights, %d on, %d gathered\n",
+                        stats.onscreenRooms, stats.litRooms, stats.totalLights, stats.lightsOn, written);
+                for (int i = 0; i < written && i < 4; i++) {
+                    const struct pdrt64Light *l = &lights[i];
+                    fprintf(stderr, "rt64:   light %d room %d at %.0f %.0f %.0f r%.0f dir %.2f %.2f %.2f rgb %.2f %.2f %.2f\n",
+                            i, l->roomnum, l->x, l->y, l->z, l->radius,
+                            l->dirx, l->diry, l->dirz, l->r, l->g, l->b);
+                }
+
+                fflush(stderr);
+            }
+        }
     }
 
     g_be.wapi->handle_events();
