@@ -152,6 +152,30 @@ PDRT64_SHIM_API void rt64ShimUpdateScreen(void);
 PDRT64_SHIM_API void rt64ShimSetTextureFiltering(int32_t filterMode, int32_t mipmapMode,
                                                  uint32_t anisotropy);
 
+/* Hands the path tracer the game's own room lights for this frame, replacing the previous
+ * frame's set whole.
+ *
+ * They cannot come through the display list. Perfect Dark bakes its level lighting into
+ * vertex colours and its RSP light path carries 32 of 5878 vertices on an in-level frame,
+ * so a tracer that waited for lights in the stream would wait forever. These come from
+ * struct light (src/include/types.h:5308), gathered from the on-screen rooms.
+ *
+ * `lights` points at `count` Rt64ShimLight, and need not outlive the call: the
+ * implementation copies what it needs.
+ *
+ * Adding this export needed no ABI bump, by the rule above: the struct and the existing
+ * signatures are untouched, and the loader resolves each entry point by name. */
+typedef struct Rt64ShimLight {
+    float x, y, z;          /* centre of the light's quad */
+    float radius;           /* centre to furthest corner - the emitter's size */
+    float dirx, diry, dirz; /* direction */
+    float r, g, b;          /* colour times brightness */
+    int32_t roomnum;
+    int32_t sparking;       /* damaged and flickering */
+} Rt64ShimLight;
+
+PDRT64_SHIM_API void rt64ShimSetRoomLights(const Rt64ShimLight *lights, int32_t count);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

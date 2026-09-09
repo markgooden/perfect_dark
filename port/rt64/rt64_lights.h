@@ -10,7 +10,9 @@
 #ifndef RT64_LIGHTS_H
 #define RT64_LIGHTS_H
 
-#include <PR/ultratypes.h>
+/* stdint, not PR/ultratypes.h: this header is compiled by the shim too, which has the
+ * game's include path nowhere near it. */
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,29 +20,36 @@ extern "C" {
 
 /* One of the game's lights, in world units, already resolved out of struct light. */
 struct pdrt64Light {
-	f32 x, y, z;          /* centre of the light's quad */
-	f32 radius;           /* distance from that centre to its furthest corner */
-	f32 dirx, diry, dirz; /* direction, normalised out of the s8 fields */
-	f32 r, g, b;          /* colour times brightness */
-	s32 roomnum;
-	s32 sparking;         /* the light is damaged and flickering */
+	float x, y, z;          /* centre of the light's quad */
+	float radius;           /* distance from that centre to its furthest corner */
+	float dirx, diry, dirz; /* direction, normalised out of the s8 fields */
+	float r, g, b;          /* colour times brightness */
+	int32_t roomnum;
+	int32_t sparking;     /* the light is damaged and flickering */
 };
 
 /* What was there to gather, whether or not it fitted. Counting separately from writing is
  * the point: a cap that silently truncates looks identical to a level with few lights. */
 struct pdrt64LightStats {
-	s32 onscreenRooms;
-	s32 litRooms;
-	s32 totalLights;
-	s32 lightsOn;
+	int32_t onscreenRooms;
+	int32_t litRooms;
+	int32_t totalLights;
+	int32_t lightsOn;
 };
 
 /* Fills `out` with the lights of every on-screen room that are switched on, up to
  * `maxLights`, and reports what was found. Either pointer may be null. Returns how many
  * were written. */
-s32 pdrt64GatherRoomLights(struct pdrt64Light *out, s32 maxLights, struct pdrt64LightStats *stats);
+int32_t pdrt64GatherRoomLights(struct pdrt64Light *out, int32_t maxLights, struct pdrt64LightStats *stats);
 
 #ifdef __cplusplus
+}
+
+namespace pdrt64 {
+	/* Hands a frame's lights to the path tracer, replacing the previous set whole. In the
+	 * game build this is the DLL loader forwarding across the shim boundary; in dlreplay it
+	 * is the direct implementation. Both live beside hostUpdateScreen. */
+	void hostSetRoomLights(const ::pdrt64Light *lights, int count);
 }
 #endif
 

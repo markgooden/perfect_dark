@@ -40,12 +40,21 @@ extern "C" {
 #include "config.h"
 #include "../fast3d/gfx_graphics_api.h"
 #include "rt64_capture.h"
-#include "rt64_lights.h"
 /* The port's private opcodes, for the survey's watchlist. Safe here for the
  * same reason it is safe in rt64_capture.cpp: this file includes the port's
  * gbi.h and never RT64's, and the two must not meet in one translation unit. */
 #include "gbiex.h"
 }
+
+/* Outside the extern "C" block above: this header declares its own C linkage for the
+ * gather function and a C++ one for the host call, and wrapping it would give both C
+ * linkage - which links, until the definition in the namespace does not match. */
+#include "rt64_lights.h"
+
+/* Enough for any room set seen so far - Defection peaks at three - and small enough that
+ * the gather costs nothing. The stats report what was there, so a level that exceeds
+ * this says so rather than quietly losing lights. */
+static const int MaxRoomLights = 256;
 
 /* The port globals the live reader spans. Declared rather than included: the
  * headers that define them drag in the game's own types, and this file has no
@@ -490,32 +499,34 @@ void rt64StartFrame(void)
         return;
     }
 
-    /* PDRT64_RT_DUMPLIGHTS: what the game's own lights amount to per frame.
+    /* The game's own lights, gathered and handed to the path tracer each frame.
      *
-     * The RSP light path carries almost nothing here - 32 of 5878 vertices on an in-level
-     * frame - so the lights a path tracer needs have to come from the game's room lights
-     * instead. This says how many there are before anything is built on them: how many
-     * rooms are on screen, how many of those are lit, and how many of their lights are
-     * switched on. Counting is separate from writing, because a cap that truncates looks
-     * exactly like a level with few lights. */
+     * They cannot come through the display list: Perfect Dark bakes its level lighting
+     * into vertex colours and its RSP light path carried 32 of 5878 vertices on an
+     * in-level frame, so a tracer waiting for lights in the stream waits forever. These
+     * come from struct light, per on-screen room (rt64_lights.h).
+     *
+     * Submitted every frame rather than on a change, because a light that has been shot
+     * out has to stop existing, and the set is a few entries.
+     *
+     * PDRT64_RT_DUMPLIGHTS reports what was there. Counting is separate from writing: a
+     * cap that truncates looks exactly like a level with few lights.
+     */
     {
-        static const char *dumpLights = nullptr;
-        static bool dumpLightsChecked = false;
-        if (!dumpLightsChecked) {
-            dumpLights = getenv("PDRT64_RT_DUMPLIGHTS");
-            dumpLightsChecked = true;
-        }
+        struct pdrt64Light lights[MaxRoomLights];
+        struct pdrt64LightStats stats;
+        const int gathered = pdrt64GatherRoomLights(lights, MaxRoomLights, &stats);
+        pdrt64::hostSetRoomLights(lights, gathered);
 
+        static const char *dumpLights = getenv("PDRT64_RT_DUMPLIGHTS");
         if (dumpLights) {
             static uint32_t lightFrames = 0;
-            const uint32_t every = (uint32_t)((atoi(dumpLights) > 0) ? atoi(dumpLights) : 120);
+            const int parsed = atoi(dumpLights);
+            const uint32_t every = (uint32_t)((parsed > 0) ? parsed : 120);
             if ((lightFrames++ % every) == 0) {
-                struct pdrt64Light lights[256];
-                struct pdrt64LightStats stats;
-                const int written = pdrt64GatherRoomLights(lights, 256, &stats);
                 fprintf(stderr, "rt64: lights - %d rooms on screen, %d lit, %d lights, %d on, %d gathered\n",
-                        stats.onscreenRooms, stats.litRooms, stats.totalLights, stats.lightsOn, written);
-                for (int i = 0; i < written && i < 4; i++) {
+                        stats.onscreenRooms, stats.litRooms, stats.totalLights, stats.lightsOn, gathered);
+                for (int i = 0; i < gathered && i < 4; i++) {
                     const struct pdrt64Light *l = &lights[i];
                     fprintf(stderr, "rt64:   light %d room %d at %.0f %.0f %.0f r%.0f dir %.2f %.2f %.2f rgb %.2f %.2f %.2f\n",
                             i, l->roomnum, l->x, l->y, l->z, l->radius,

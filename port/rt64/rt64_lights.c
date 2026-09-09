@@ -30,7 +30,7 @@
 
 #include "rt64_lights.h"
 
-s32 pdrt64GatherRoomLights(struct pdrt64Light *out, s32 maxLights, struct pdrt64LightStats *stats)
+int32_t pdrt64GatherRoomLights(struct pdrt64Light *out, int32_t maxLights, struct pdrt64LightStats *stats)
 {
 	s32 written = 0;
 

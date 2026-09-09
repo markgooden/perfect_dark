@@ -61,6 +61,8 @@ const char *hostResultName(HostResult r)
 
 #include <cwchar>
 
+#include "rt64_lights.h"
+
 namespace pdrt64 {
 
 namespace {
@@ -72,6 +74,7 @@ using ReadyFn = int32_t (*)(void);
 using ProcessDlFn = void (*)(uint32_t, uint32_t);
 using UpdateScreenFn = void (*)(void);
 using SetTextureFilteringFn = void (*)(int32_t, int32_t, uint32_t);
+using SetRoomLightsFn = void (*)(const Rt64ShimLight *, int32_t);
 
 struct Shim {
     HMODULE module = nullptr;
@@ -82,6 +85,7 @@ struct Shim {
     ProcessDlFn processDl = nullptr;
     UpdateScreenFn updateScreen = nullptr;
     SetTextureFilteringFn setTextureFiltering = nullptr;
+    SetRoomLightsFn setRoomLights = nullptr;
 
     /* The port sets the texture filter from videoInit (video.c:175), which can
      * run before the DLL is up. Remembered here and replayed after init, so
@@ -191,7 +195,8 @@ HostResult openShim()
         !resolve(module, "rt64ShimReady", &s.ready) ||
         !resolve(module, "rt64ShimProcessDl", &s.processDl) ||
         !resolve(module, "rt64ShimUpdateScreen", &s.updateScreen) ||
-        !resolve(module, "rt64ShimSetTextureFiltering", &s.setTextureFiltering)) {
+        !resolve(module, "rt64ShimSetTextureFiltering", &s.setTextureFiltering) ||
+        !resolve(module, "rt64ShimSetRoomLights", &s.setRoomLights)) {
         FreeLibrary(module);
         return HostResult::ShimEntryPointMissing;
     }
@@ -289,6 +294,21 @@ void hostUpdateScreen()
         return;
     }
     g_shim.updateScreen();
+}
+
+/* Contract in rt64_lights.h. Rt64ShimLight and pdrt64Light are the same POD in the same
+ * order and both halves compile the same headers, so this reinterprets rather than
+ * converting - a conversion here would be a second place for the two to drift. */
+void hostSetRoomLights(const ::pdrt64Light *lights, int count)
+{
+    static_assert(sizeof(Rt64ShimLight) == sizeof(pdrt64Light),
+                  "Rt64ShimLight and pdrt64Light must stay the same POD");
+
+    if (!g_shim.setRoomLights) {
+        return;
+    }
+
+    g_shim.setRoomLights(reinterpret_cast<const Rt64ShimLight *>(lights), int32_t(count));
 }
 
 void hostSetTextureFiltering(int filterMode, int mipmapMode, uint32_t anisotropy)

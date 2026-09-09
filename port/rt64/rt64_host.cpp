@@ -60,7 +60,9 @@ void hostUpdateScreen() {}
 #include "hle/rt64_workload_queue.h"
 #include "render/rt64_framebuffer_renderer.h"
 #include "render/rt64_rt_readback.h"
+#include "rt64_lights.h"
 #include "rt64_rtdebug.h"
+#include "render/rt64_external_lights.h"
 #endif
 
 namespace pdrt64 {
@@ -566,6 +568,46 @@ void hostUpdateScreen()
 }
 
 #if RT_ENABLED
+/* Contract in rt64_lights.h. Converts the game's room lights into RT64's own and hands
+ * them to the frame graph, replacing the previous frame's set whole.
+ *
+ * A room light is an area light - four bbox corners - so its extent becomes pointRadius,
+ * which is what gives a traced shadow its penumbra. attenuationRadius is its reach, and
+ * the game does not record one: the lights are authored to light a room, so the reach is
+ * derived from the extent rather than invented per light. */
+void hostSetRoomLights(const ::pdrt64Light *lights, int count)
+{
+    if (!g_host.app) {
+        return;
+    }
+
+    static std::vector<interop::PointLight> converted;
+    converted.clear();
+
+    for (int i = 0; i < count; i++) {
+        const ::pdrt64Light &src = lights[i];
+        interop::PointLight dst = {};
+        dst.position = { src.x, src.y, src.z };
+        dst.direction = { src.dirx, src.diry, src.dirz };
+        dst.diffuseColor = { src.r, src.g, src.b };
+        dst.specularColor = { src.r, src.g, src.b };
+
+        /* The emitter's own size, so a bigger fitting casts a softer shadow. */
+        dst.pointRadius = (src.radius > 0.0f) ? src.radius : 1.0f;
+
+        /* Reach. A multiple of the extent rather than a constant: these run from small
+         * fittings to long strips, and a fixed radius would either strand the small ones or
+         * let the large ones light through the level. */
+        dst.attenuationRadius = dst.pointRadius * 16.0f;
+        dst.attenuationExponent = 1.0f;
+        dst.flickerIntensity = src.sparking ? 1.0f : 0.0f;
+        dst.groupBits = 0xFFFF;
+        converted.push_back(dst);
+    }
+
+    RT64::ExternalLights::set(converted.data(), uint32_t(converted.size()));
+}
+
 /* Contract and rationale in rt64_rtdebug.h. */
 bool rtDebugReadbackImage(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
 {
