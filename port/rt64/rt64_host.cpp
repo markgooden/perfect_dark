@@ -56,6 +56,12 @@ void hostUpdateScreen() {}
 #include "gbi/rt64_gbi_f3dpd.h"
 #include "gbi/rt64_gbi_rdp.h"
 #include "hle/rt64_application.h"
+#if RT_ENABLED
+#include "hle/rt64_workload_queue.h"
+#include "render/rt64_framebuffer_renderer.h"
+#include "render/rt64_rt_readback.h"
+#include "rt64_rtdebug.h"
+#endif
 
 namespace pdrt64 {
 
@@ -558,6 +564,30 @@ void hostUpdateScreen()
     }
     g_host.app->updateScreen();
 }
+
+#if RT_ENABLED
+/* Contract and rationale in rt64_rtdebug.h. */
+bool rtDebugReadbackImage(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+{
+    if (!g_host.app || !g_host.app->workloadQueue || !g_host.app->device) {
+        return false;
+    }
+
+    RT64::FramebufferRenderer *renderer = g_host.app->workloadQueue->framebufferRenderer.get();
+    if (renderer == nullptr) {
+        return false;
+    }
+
+    /* Null until a frame has actually traced something, which is the common case for
+     * menus and for every frame before the first dispatch. */
+    RT64::RenderTarget *target = renderer->rtComposeTarget;
+    if (target == nullptr) {
+        return false;
+    }
+
+    return RT64::rtReadbackTargetRgba(g_host.app->device.get(), target, rgba, width, height);
+}
+#endif
 
 } // namespace pdrt64
 
