@@ -620,14 +620,15 @@ bool rtDebugReadbackImage(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t 
         return false;
     }
 
-    /* Null until a frame has actually traced something, which is the common case for
-     * menus and for every frame before the first dispatch. */
-    RT64::RenderTarget *target = renderer->rtComposeTarget;
-    if (target == nullptr) {
-        return false;
-    }
-
-    return RT64::rtReadbackTargetRgba(g_host.app->device.get(), target, rgba, width, height);
+    /* The copy itself is recorded on the render thread, in the frame that drew it, so
+     * nothing here touches the target - reading it from this thread is what faulted before
+     * (rt64_rt_readback.h). This only collects what that copy produced, and returns false
+     * until a frame has actually been traced and drained: the common case for menus and for
+     * every frame before the first dispatch.
+     *
+     * The result is one frame behind for the reason given in that header, so a harness
+     * wanting frame N's image has to run N+1 frames. */
+    return renderer->rtReadback.take(rgba, width, height);
 }
 #endif
 
