@@ -24,6 +24,8 @@ struct pdrt64Light {
 	float radius;           /* distance from that centre to its furthest corner */
 	float dirx, diry, dirz; /* direction, normalised out of the s8 fields */
 	float r, g, b;          /* colour times brightness */
+	float roomradius;     /* the room the light is in, centre to corner */
+	float camdist;        /* distance from the camera, for choosing which lights to keep */
 	int32_t roomnum;
 	int32_t sparking;     /* the light is damaged and flickering */
 };
@@ -32,6 +34,7 @@ struct pdrt64Light {
  * the point: a cap that silently truncates looks identical to a level with few lights. */
 struct pdrt64LightStats {
 	int32_t onscreenRooms;
+	int32_t nearbyRooms;  /* visible, or visible recently enough to still light what is */
 	int32_t litRooms;
 	int32_t totalLights;
 	int32_t lightsOn;

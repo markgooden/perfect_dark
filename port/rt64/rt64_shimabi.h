@@ -47,8 +47,14 @@
 
 /* Bump on any change to the struct below or to an exported signature. Adding
  * a new export does not require a bump; the loader resolves each one and
- * reports which is missing. */
-#define PDRT64_SHIM_ABI_VERSION 1u
+ * reports which is missing.
+ *
+ * 2 (2026-09-13): Rt64ShimLight gained roomradius and camdist, so a version 1
+ * shim paired with this port would read a light's colour where its room size
+ * should be. The static_assert against sizeof(pdrt64Light) caught the same
+ * mismatch inside one build; this catches it across the DLL boundary, which is
+ * the half a compiler cannot see. */
+#define PDRT64_SHIM_ABI_VERSION 2u
 
 /*
  * The exports carry dllexport when the DLL itself is being built and nothing
@@ -170,6 +176,8 @@ typedef struct Rt64ShimLight {
     float radius;           /* centre to furthest corner - the emitter's size */
     float dirx, diry, dirz; /* direction */
     float r, g, b;          /* colour times brightness */
+    float roomradius;       /* the room the light is in - its reach */
+    float camdist;          /* distance from the camera, for ranking */
     int32_t roomnum;
     int32_t sparking;       /* damaged and flickering */
 } Rt64ShimLight;

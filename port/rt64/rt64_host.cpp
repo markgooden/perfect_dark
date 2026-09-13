@@ -620,14 +620,58 @@ void hostSetRoomLights(const ::pdrt64Light *lights, int count)
         /* The emitter's own size, so a bigger fitting casts a softer shadow. */
         dst.pointRadius = (src.radius > 0.0f) ? src.radius : 1.0f;
 
-        /* Reach. A multiple of the extent rather than a constant: these run from small
-         * fittings to long strips, and a fixed radius would either strand the small ones or
-         * let the large ones light through the level. */
-        dst.attenuationRadius = dst.pointRadius * 16.0f;
+        /* Reach: the room the light is in.
+         *
+         * This was pointRadius * 16 - a guess made when nothing depended on it, and wrong in
+         * both directions once something did. A small fitting in a large hall lit a sphere
+         * around itself and left the rest of the room dark, and a long strip lit through the
+         * walls. A light in this game is authored to light *a room*, and the game records
+         * each room's size, so that is the number to use. The fitting's own extent stays as
+         * a floor for the case where a room radius did not come through. */
+        dst.attenuationRadius = std::max(src.roomradius, dst.pointRadius * 2.0f);
         dst.attenuationExponent = 1.0f;
         dst.flickerIntensity = src.sparking ? 1.0f : 0.0f;
         dst.groupBits = 0xFFFF;
         converted.push_back(dst);
+    }
+
+    /* Keep the ones that matter. Every light costs diSamples shadow rays per pixel that it
+     * reaches, so the set has to be bounded, and now that rooms off screen contribute there
+     * are more candidates than there were. Scored by what a light can deliver to where the
+     * camera is - brightness over distance squared - which is the same falloff the shader
+     * applies, so the ones dropped are the ones that would have arrived dimmest.
+     *
+     * PDRT64_RT_MAXLIGHTS overrides the bound. */
+    static const size_t maxLights = []() -> size_t {
+        const char *env = getenv("PDRT64_RT_MAXLIGHTS");
+        const int parsed = (env != nullptr) ? atoi(env) : 0;
+        return (parsed > 0) ? size_t(parsed) : 16;
+    }();
+
+    if (converted.size() > maxLights) {
+        /* Scored against the source array, because camdist lives there: the converted light
+         * is RT64's own type and carries no notion of where the camera was. */
+        static std::vector<std::pair<float, size_t>> ranked;
+        ranked.clear();
+        for (size_t i = 0; i < converted.size(); i++) {
+            const ::pdrt64Light &src = lights[i];
+            const float brightness = src.r + src.g + src.b;
+            const float distance = std::max(src.camdist, 1.0f);
+            ranked.emplace_back(brightness / (distance * distance), i);
+        }
+
+        std::partial_sort(ranked.begin(), ranked.begin() + maxLights, ranked.end(),
+            [](const std::pair<float, size_t> &a, const std::pair<float, size_t> &b) {
+                return a.first > b.first;
+            });
+
+        static std::vector<interop::PointLight> kept;
+        kept.clear();
+        for (size_t i = 0; i < maxLights; i++) {
+            kept.push_back(converted[ranked[i].second]);
+        }
+
+        converted.swap(kept);
     }
 
     RT64::ExternalLights::set(converted.data(), uint32_t(converted.size()));

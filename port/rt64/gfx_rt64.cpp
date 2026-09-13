@@ -524,8 +524,8 @@ void rt64StartFrame(void)
             const int parsed = atoi(dumpLights);
             const uint32_t every = (uint32_t)((parsed > 0) ? parsed : 120);
             if ((lightFrames++ % every) == 0) {
-                fprintf(stderr, "rt64: lights - %d rooms on screen, %d lit, %d lights, %d on, %d gathered\n",
-                        stats.onscreenRooms, stats.litRooms, stats.totalLights, stats.lightsOn, gathered);
+                fprintf(stderr, "rt64: lights - %d rooms nearby (%d on screen), %d lit, %d lights, %d on, %d gathered\n",
+                        stats.nearbyRooms, stats.onscreenRooms, stats.litRooms, stats.totalLights, stats.lightsOn, gathered);
                 for (int i = 0; i < gathered && i < 4; i++) {
                     const struct pdrt64Light *l = &lights[i];
                     fprintf(stderr, "rt64:   light %d room %d at %.0f %.0f %.0f r%.0f dir %.2f %.2f %.2f rgb %.2f %.2f %.2f\n",

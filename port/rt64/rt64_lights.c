@@ -35,6 +35,7 @@ int32_t pdrt64GatherRoomLights(struct pdrt64Light *out, int32_t maxLights, struc
 	s32 written = 0;
 
 	if (stats) {
+		stats->nearbyRooms = 0;
 		stats->onscreenRooms = 0;
 		stats->litRooms = 0;
 		stats->totalLights = 0;
@@ -45,14 +46,35 @@ int32_t pdrt64GatherRoomLights(struct pdrt64Light *out, int32_t maxLights, struc
 		return 0;
 	}
 
+	/* Where the camera is, for deciding which lights are worth keeping when there are more
+	 * than the tracer can afford. Null before a player exists, which is every menu frame. */
+	const struct player *player = g_Vars.currentplayer;
+	const f32 camx = player ? player->cam_pos.x : 0.0f;
+	const f32 camy = player ? player->cam_pos.y : 0.0f;
+	const f32 camz = player ? player->cam_pos.z : 0.0f;
+
 	for (s32 roomnum = 0; roomnum < g_Vars.roomcount; roomnum++) {
 		const struct room *room = &g_Rooms[roomnum];
-		if ((room->flags & ROOMFLAG_ONSCREEN) == 0) {
+		const s32 onscreen = (room->flags & ROOMFLAG_ONSCREEN) != 0;
+
+		/* Rooms that are visible, and rooms that were visible recently.
+		 *
+		 * Only on-screen rooms were gathered before, which meant a light never lit anything
+		 * outside its own room: stand in a doorway and the room behind you stops
+		 * contributing the instant it leaves the frustum, though its light still falls on
+		 * the floor in front of you. loaded240 is the game's own answer to "is this room
+		 * still relevant" - 1 while visible, ticking down from 120 after - and it is exactly
+		 * the set a path tracer wants, because light arrives from places the camera cannot
+		 * see. That is most of the point of tracing it. */
+		if (room->loaded240 == 0) {
 			continue;
 		}
 
 		if (stats) {
-			stats->onscreenRooms++;
+			stats->nearbyRooms++;
+			if (onscreen) {
+				stats->onscreenRooms++;
+			}
 		}
 
 		const s32 numlights = room->numlights;
@@ -118,6 +140,17 @@ int32_t pdrt64GatherRoomLights(struct pdrt64Light *out, int32_t maxLights, struc
 			dst->r = (f32)((light->colour >> 12) & 0xf) / 15.0f * brightness;
 			dst->g = (f32)((light->colour >> 8) & 0xf) / 15.0f * brightness;
 			dst->b = (f32)((light->colour >> 4) & 0xf) / 15.0f * brightness;
+
+			/* The room's own size. A light is authored to light its room, so the room is
+			 * what its reach should be - which beats the multiple of the fitting's extent
+			 * that stood here, where a small fitting in a large hall lit a sphere around
+			 * itself and nothing else. */
+			dst->roomradius = room->radius;
+
+			const f32 lx = dst->x - camx;
+			const f32 ly = dst->y - camy;
+			const f32 lz = dst->z - camz;
+			dst->camdist = sqrtf(lx * lx + ly * ly + lz * lz);
 
 			dst->roomnum = roomnum;
 			dst->sparking = light->sparking ? 1 : 0;
